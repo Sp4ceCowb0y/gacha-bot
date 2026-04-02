@@ -6,6 +6,8 @@
 // @author       Sp4ceCowb0y
 // @match        https://gacha.miz.to/*
 // @grant        none
+// @updateURL    https://raw.githubusercontent.com/Sp4ceCowb0y/gacha-bot/master/gacha-bot.user.js
+// @downloadURL  https://raw.githubusercontent.com/Sp4ceCowb0y/gacha-bot/master/gacha-bot.user.js
 // ==/UserScript==
 
 // ───────────────────────────────────────────────────────────────────
