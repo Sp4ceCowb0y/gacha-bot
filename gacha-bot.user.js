@@ -1234,8 +1234,8 @@
 
             <div style="padding:12px 14px;">
 
-                <!-- Auto Open section -->
-                <div class="gcb-label">Auto Open</div>
+                <!-- Auto-Open section -->
+                <div class="gcb-label">Auto-Open</div>
                 <div class="gcb-toggle-wrap" style="margin-bottom:8px;">
                     <label class="gcb-toggle">
                         <input type="checkbox" id="gcb-ao-toggle" ${prefs.autoOpen ? "checked" : ""}>
