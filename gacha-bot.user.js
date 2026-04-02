@@ -1,13 +1,13 @@
 // ==UserScript==
-// @name         GachaBot
+// @name         GachaBot (Beta)
 // @namespace    http://tampermonkey.net/
-// @version      1.31
+// @version      1.32-beta
 // @description  Auto-open packs + collection filter panel for gacha.miz.to
 // @author       Sp4ceCowb0y
 // @match        https://gacha.miz.to/*
 // @grant        none
-// @updateURL    https://raw.githubusercontent.com/Sp4ceCowb0y/gacha-bot/master/gacha-bot.user.js
-// @downloadURL  https://raw.githubusercontent.com/Sp4ceCowb0y/gacha-bot/master/gacha-bot.user.js
+// @updateURL    https://raw.githubusercontent.com/Sp4ceCowb0y/gacha-bot/dev/gacha-bot.user.js
+// @downloadURL  https://raw.githubusercontent.com/Sp4ceCowb0y/gacha-bot/dev/gacha-bot.user.js
 // ==/UserScript==
 
 // ───────────────────────────────────────────────────────────────────
