@@ -1164,20 +1164,10 @@
     const header = document.createElement("div");
     header.style.cssText =
       "display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;";
-    const hasMythic = pack.cards.some(c => c.rarity === "mythic");
     header.innerHTML = `
               <span style="font-size:11px;color:#6b7280;">${new Date(pack.timestamp).toLocaleString()}</span>
-              <span style="display:flex;align-items:center;gap:8px;">
-                ${hasMythic ? `<button class="gcb-mythic-badge" id="gcb-hist-mythic-${pack.timestamp}">✦ MYTHIC</button>` : ""}
-                <span style="font-size:10px;color:#374151;font-family:monospace;">${pack.cards.length} card${pack.cards.length !== 1 ? "s" : ""}</span>
-              </span>
+              <span style="font-size:10px;color:#374151;font-family:monospace;">${pack.cards.length} card${pack.cards.length !== 1 ? "s" : ""}</span>
           `;
-    if (hasMythic) {
-      header.querySelector(`#gcb-hist-mythic-${pack.timestamp}`).addEventListener("click", () => {
-        const modal = document.getElementById("gcb-mythic-modal");
-        if (modal) { modal.style.display = "flex"; mythicWindowOpen = true; renderMythicWindow(); }
-      });
-    }
 
     const grid = document.createElement("div");
     grid.style.cssText = "display:flex;flex-wrap:wrap;gap:8px;";
@@ -1405,6 +1395,7 @@
                  cursor:grab;user-select:none;flex-shrink:0;">
                 <span style="font-weight:800;font-size:12px;letter-spacing:3px;
                      color:#3b82f6;text-transform:uppercase;">Pack History</span>
+                <button id="gcb-hist-mythic-btn" class="gcb-mythic-badge">✦ Mythic Pulls</button>
                 <div style="display:flex;gap:10px;align-items:center;">
                     <button id="gcb-hist-clear" style="font-size:11px;color:#ef4444;background:none;
                         border:1px solid #ef444440;border-radius:6px;padding:3px 10px;cursor:pointer;">
@@ -1428,6 +1419,10 @@
         saveHistory([]);
         renderHistory();
       }
+    });
+    modal.querySelector("#gcb-hist-mythic-btn").addEventListener("click", () => {
+      const mythicModal = document.getElementById("gcb-mythic-modal");
+      if (mythicModal) { mythicModal.style.display = "flex"; mythicWindowOpen = true; renderMythicWindow(); }
     });
 
     makeDraggable(modal, modal.querySelector("#gcb-hist-header"));
