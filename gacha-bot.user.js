@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GachaBot (Beta)
 // @namespace    http://tampermonkey.net/
-// @version      1.33-beta
+// @version      1.34-beta
 // @description  Auto-open packs + collection filter panel for gacha.miz.to
 // @author       Sp4ceCowb0y
 // @match        https://gacha.miz.to/*
@@ -13,6 +13,12 @@
 // ───────────────────────────────────────────────────────────────────
 //  CHANGELOG
 // ───────────────────────────────────────────────────────────────────
+//  v1.34 Add: clicking anywhere outside the history panel now closes it.
+//        Add: "Remember Deleted" blacklist in the Auto-Delete panel. When enabled,
+//        deleted cards matching the configured rarities (default: legendary + epic)
+//        are stored in gcb-blacklist and auto-deleted whenever they are repulled,
+//        independently of the rarity/nationality rules.
+//
 //  v1.33 Bump version to trigger Tampermonkey auto-update (v1.32 shipped without
 //        a version increment so existing installs did not detect the update).
 //
@@ -199,8 +205,9 @@
   const POLL_RATE_MS = 300;
   const FALLBACK_CHECK_MS = 5 * 1000;
 
-  const RARITIES = ["legendary", "epic", "rare", "uncommon", "common"];
+  const RARITIES = ["mythic", "legendary", "epic", "rare", "uncommon", "common"];
   const RARITY_COLORS = {
+    mythic: "#ef4444",
     legendary: "#fcd34d",
     epic: "#c084fc",
     rare: "#60a5fa",
@@ -678,6 +685,51 @@
 
   // ─── Auto-delete config ────────────────────────────────────────────────────
   const AD_KEY = "gcb-auto-delete";
+  const BL_KEY = "gcb-blacklist";
+  const BL_CFG_KEY = "gcb-blacklist-cfg";
+
+  function loadBlacklist() {
+    try { return JSON.parse(localStorage.getItem(BL_KEY) || "{}"); }
+    catch { return {}; }
+  }
+  function saveBlacklist(bl) {
+    localStorage.setItem(BL_KEY, JSON.stringify(bl));
+  }
+
+  function loadBlacklistConfig() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(BL_CFG_KEY) || "{}");
+      return {
+        enabled:  !!raw.enabled,
+        rarities: new Set(raw.rarities || ["legendary", "epic"]),
+      };
+    } catch {
+      return { enabled: false, rarities: new Set(["legendary", "epic"]) };
+    }
+  }
+  function saveBlacklistConfig(cfg) {
+    localStorage.setItem(BL_CFG_KEY, JSON.stringify({
+      enabled:  cfg.enabled,
+      rarities: [...cfg.rarities],
+    }));
+  }
+
+  // Add a card to the blacklist if blacklisting is enabled and the card's
+  // rarity is in the configured set. Safe to call on every delete.
+  function addToBlacklist(card) {
+    const cfg = loadBlacklistConfig();
+    if (!cfg.enabled) return;
+    if (!cfg.rarities.has(card.rarity)) return;
+    const bl = loadBlacklist();
+    bl[card.id] = { name: card.name, rarity: card.rarity, country: card.country };
+    saveBlacklist(bl);
+  }
+
+  // Returns true if this card ID is in the blacklist AND blacklisting is enabled.
+  function isBlacklisted(cardId) {
+    if (!loadBlacklistConfig().enabled) return false;
+    return !!loadBlacklist()[cardId];
+  }
 
   function loadAutoDeleteConfig() {
     try {
@@ -739,11 +791,12 @@
     console.log(`[GachaBot] runAutoDelete: enabled=${cfg.enabled}, rarities=[${[...cfg.rarities]}], natMode=${cfg.natMode}, nations=[${[...cfg.nations]}], cards=${cards.map(c => `${c.name}(${c.rarity},${c.country})`).join(", ")}`);
     if (!cfg.enabled) return;
     for (const card of cards) {
-      if (!shouldAutoDelete(card, cfg)) continue;
+      if (!shouldAutoDelete(card, cfg) && !isBlacklisted(card.id)) continue;
       const ok = await apiDelete(card.id);
       if (ok) {
         markCollectionDeleted(card.id);
         if (packTs) saveDeletedInstance(packTs, card.id);
+        addToBlacklist(card);
         console.log(`[GachaBot] Auto-deleted: ${card.name} (${card.rarity}, ${card.country})`);
       }
     }
@@ -1026,6 +1079,7 @@
         state.deleted = true;
         if (packTs) saveDeletedInstance(packTs, card.id);
         markCollectionDeleted(card.id);
+        addToBlacklist(card);
         overlay.style.display = "none";
         deletedLabel.style.display = "flex";
         removeCardFromCollectionDom(card.id);
@@ -1133,6 +1187,14 @@
     });
 
     makeDraggable(modal, modal.querySelector("#gcb-hist-header"));
+
+    // Close when clicking outside the modal
+    document.addEventListener("mousedown", (e) => {
+      if (historyWindowOpen && !modal.contains(e.target)) {
+        modal.style.display = "none";
+        historyWindowOpen = false;
+      }
+    });
 
     return modal;
   }
@@ -1330,6 +1392,22 @@
                         <p class="gcb-label">Whitelist (never delete)</p>
                         <textarea id="gcb-ad-whitelist" rows="3" placeholder="Player names, one per line" style="width:100%;background:#111827;border:1px solid #374151;border-radius:6px;color:#d1d5db;font-size:11px;padding:6px;resize:vertical;font-family:monospace;margin-bottom:4px;line-height:1.5;"></textarea>
                         <p style="font-size:10px;color:#4b5563;margin:0;">Whitelisted names are never auto-deleted.</p>
+                        <!-- Blacklist -->
+                        <div style="border-top:1px solid #1f2937;margin-top:12px;padding-top:10px;">
+                            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+                                <p class="gcb-label" style="margin:0;">Remember Deleted</p>
+                                <label class="gcb-toggle" style="margin:0;" id="gcb-bl-toggle-label">
+                                    <input type="checkbox" id="gcb-bl-enabled">
+                                    <span class="gcb-slider"></span>
+                                </label>
+                            </div>
+                            <p style="font-size:10px;color:#4b5563;margin:0 0 6px;">Repulled cards matching these rarities are auto-deleted:</p>
+                            <div id="gcb-bl-rarities" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px;"></div>
+                            <div style="display:flex;align-items:center;justify-content:space-between;">
+                                <span id="gcb-bl-count" style="font-size:10px;color:#4b5563;">0 remembered</span>
+                                <button id="gcb-bl-clear" style="font-size:10px;color:#ef4444;background:none;border:1px solid #ef444440;border-radius:6px;padding:2px 8px;cursor:pointer;">Clear</button>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
@@ -1543,6 +1621,59 @@
           adWhitelistEl.value.split("\n").map(s => s.trim().toLowerCase().normalize("NFC")).filter(Boolean)
         );
         saveAutoDeleteConfig(cfg);
+      });
+
+      // ── Blacklist sub-section ──
+      const blCfg = loadBlacklistConfig();
+
+      const blEnabled = panel.querySelector("#gcb-bl-enabled");
+      blEnabled.checked = blCfg.enabled;
+      panel.querySelector("#gcb-bl-toggle-label").addEventListener("click", (e) => {
+        e.stopPropagation();
+      });
+      blEnabled.addEventListener("change", () => {
+        blCfg.enabled = blEnabled.checked;
+        saveBlacklistConfig(blCfg);
+      });
+
+      const blCountEl = panel.querySelector("#gcb-bl-count");
+      function refreshBlCount() {
+        const n = Object.keys(loadBlacklist()).length;
+        blCountEl.textContent = `${n} remembered`;
+      }
+      refreshBlCount();
+
+      const blRaritiesEl = panel.querySelector("#gcb-bl-rarities");
+      for (const r of RARITIES) {
+        const btn = document.createElement("button");
+        btn.className = "gcb-rarity-btn";
+        btn.textContent = r[0].toUpperCase() + r.slice(1);
+        btn.style.border = `1px solid ${RARITY_COLORS[r]}40`;
+        btn.style.color  = RARITY_COLORS[r];
+        if (blCfg.rarities.has(r)) {
+          btn.style.background = RARITY_COLORS[r] + "22";
+          btn.style.fontWeight = "700";
+        }
+        btn.addEventListener("click", () => {
+          if (blCfg.rarities.has(r)) {
+            blCfg.rarities.delete(r);
+            btn.style.background = "transparent";
+            btn.style.fontWeight = "400";
+          } else {
+            blCfg.rarities.add(r);
+            btn.style.background = RARITY_COLORS[r] + "22";
+            btn.style.fontWeight = "700";
+          }
+          saveBlacklistConfig(blCfg);
+        });
+        blRaritiesEl.appendChild(btn);
+      }
+
+      panel.querySelector("#gcb-bl-clear").addEventListener("click", () => {
+        if (confirm("Clear the blacklist? Repulled cards will no longer be auto-deleted.")) {
+          saveBlacklist({});
+          refreshBlCount();
+        }
       });
     })();
 
