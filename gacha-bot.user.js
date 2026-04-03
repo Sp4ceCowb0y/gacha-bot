@@ -1164,10 +1164,20 @@
     const header = document.createElement("div");
     header.style.cssText =
       "display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;";
+    const hasMythic = pack.cards.some(c => c.rarity === "mythic");
     header.innerHTML = `
               <span style="font-size:11px;color:#6b7280;">${new Date(pack.timestamp).toLocaleString()}</span>
-              <span style="font-size:10px;color:#374151;font-family:monospace;">${pack.cards.length} card${pack.cards.length !== 1 ? "s" : ""}</span>
+              <span style="display:flex;align-items:center;gap:8px;">
+                ${hasMythic ? `<button class="gcb-mythic-badge" id="gcb-hist-mythic-${pack.timestamp}">✦ MYTHIC</button>` : ""}
+                <span style="font-size:10px;color:#374151;font-family:monospace;">${pack.cards.length} card${pack.cards.length !== 1 ? "s" : ""}</span>
+              </span>
           `;
+    if (hasMythic) {
+      header.querySelector(`#gcb-hist-mythic-${pack.timestamp}`).addEventListener("click", () => {
+        const modal = document.getElementById("gcb-mythic-modal");
+        if (modal) { modal.style.display = "flex"; mythicWindowOpen = true; renderMythicWindow(); }
+      });
+    }
 
     const grid = document.createElement("div");
     grid.style.cssText = "display:flex;flex-wrap:wrap;gap:8px;";
@@ -1505,6 +1515,18 @@
             #gcb-mythic-toast-title {
                 animation: gcb-mythic-text 1.4s ease-in-out infinite;
             }
+            @keyframes gcb-mythic-badge-pulse {
+                0%,100% { box-shadow: 0 0 6px 1px rgba(239,68,68,0.7); opacity:1; }
+                50%      { box-shadow: 0 0 14px 4px rgba(239,68,68,1); opacity:0.8; }
+            }
+            .gcb-mythic-badge {
+                display:inline-flex; align-items:center; gap:4px;
+                padding:2px 7px; border-radius:10px; font-size:10px; font-weight:800;
+                letter-spacing:1.5px; text-transform:uppercase; cursor:pointer;
+                background:#7f1d1d; color:#fca5a5; border:1px solid #ef4444;
+                animation: gcb-mythic-badge-pulse 1.2s ease-in-out infinite;
+            }
+            .gcb-mythic-badge:hover { background:#991b1b; }
 
             /* Correct fav button appearance when collection tab remounts from RSC cache.
                React controls button classes; we set data-gcb-fav on the wrapper, which
