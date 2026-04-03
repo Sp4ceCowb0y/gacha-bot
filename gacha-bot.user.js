@@ -216,6 +216,39 @@
   };
 
   // ═══════════════════════════════════════════════════════════════
+  //  UTILITIES
+  // ═══════════════════════════════════════════════════════════════
+
+  // Thin wrapper around localStorage JSON read/write.
+  // getJSON returns `fallback` when the key is absent or the stored value is
+  // unparseable, so callers never need their own try/catch.
+  const StorageUtils = {
+    getJSON(key, fallback = {}) {
+      try {
+        const raw = localStorage.getItem(key);
+        return raw === null ? fallback : JSON.parse(raw);
+      } catch {
+        return fallback;
+      }
+    },
+    setJSON(key, value) {
+      localStorage.setItem(key, JSON.stringify(value));
+    },
+  };
+
+  // Memoises getElementById results and re-fetches automatically if the cached
+  // element has been removed from the document (e.g. after a page navigation).
+  const DOMCache = {
+    _c: {},
+    get(id) {
+      const el = this._c[id];
+      if (el && document.contains(el)) return el;
+      return (this._c[id] = document.getElementById(id));
+    },
+    clear() { this._c = {}; },
+  };
+
+  // ═══════════════════════════════════════════════════════════════
   //  PERSISTED STATE
   // ═══════════════════════════════════════════════════════════════
   const prefs = {
@@ -307,7 +340,7 @@
   }
 
   function setStatus(msg, color = "#6b7280") {
-    const el = document.getElementById("gcb-status");
+    const el = DOMCache.get("gcb-status");
     if (el) {
       el.textContent = msg;
       el.style.color = color;
@@ -467,7 +500,7 @@
       if (show) visible++;
     }
     if (!loadingAllCards) {
-      const el = document.getElementById("gcb-filter-count");
+      const el = DOMCache.get("gcb-filter-count");
       if (el) el.textContent = `Showing ${visible} of ${total} cards`;
     }
   }
@@ -504,17 +537,13 @@
   }
 
   function loadHistory() {
-    try {
-      return JSON.parse(localStorage.getItem("gcb-history") || "[]");
-    } catch {
-      return [];
-    }
+    return StorageUtils.getJSON("gcb-history", []);
   }
 
   function saveHistory(history) {
     if (history.length > MAX_HISTORY_PACKS)
       history = history.slice(-MAX_HISTORY_PACKS);
-    localStorage.setItem("gcb-history", JSON.stringify(history));
+    StorageUtils.setJSON("gcb-history", history);
   }
 
   // Called from the MutationObserver (300 ms debounce).
@@ -559,7 +588,7 @@
     if (mythics.length) {
       showMythicNotification(mythics);
       if (mythicWindowOpen) prependMythicCards(mythics);
-      const mythicBtn = document.getElementById("gcb-hist-mythic-btn");
+      const mythicBtn = DOMCache.get("gcb-hist-mythic-btn");
       if (mythicBtn) mythicBtn.style.display = "inline-flex";
     }
   }
@@ -644,49 +673,32 @@
 
   // Per-card state (favourited) persisted across modal reopens — keyed by player ID.
   function loadCardStates() {
-    try {
-      return JSON.parse(localStorage.getItem("gcb-card-states") || "{}");
-    } catch {
-      return {};
-    }
+    return StorageUtils.getJSON("gcb-card-states");
   }
   function saveCardState(id, patch) {
     const all = loadCardStates();
     all[id] = Object.assign(all[id] || {}, patch);
-    localStorage.setItem("gcb-card-states", JSON.stringify(all));
+    StorageUtils.setJSON("gcb-card-states", all);
   }
 
   // Per-pack-card deleted state — keyed by `${packTimestamp}_${cardId}`.
   // This lets the same player appear un-deleted in a different pack.
   function loadDeletedInstances() {
-    try {
-      return JSON.parse(localStorage.getItem("gcb-deleted-instances") || "{}");
-    } catch {
-      return {};
-    }
+    return StorageUtils.getJSON("gcb-deleted-instances");
   }
   function saveDeletedInstance(packTs, cardId) {
     const all = loadDeletedInstances();
     all[`${packTs}_${cardId}`] = true;
-    localStorage.setItem("gcb-deleted-instances", JSON.stringify(all));
+    StorageUtils.setJSON("gcb-deleted-instances", all);
   }
 
   // Collection-level deleted IDs — keyed by player ID, checked on every Collection tab activation.
   // Handles the case where the tab was inactive (unmounted) at deletion time so DOM removal was a no-op.
   function loadCollectionDeleted() {
-    try {
-      return new Set(
-        JSON.parse(localStorage.getItem("gcb-collection-deleted") || "[]"),
-      );
-    } catch {
-      return new Set();
-    }
+    return new Set(StorageUtils.getJSON("gcb-collection-deleted", []));
   }
   function saveCollectionDeleted(ids) {
-    localStorage.setItem(
-      "gcb-collection-deleted",
-      JSON.stringify([...ids]),
-    );
+    StorageUtils.setJSON("gcb-collection-deleted", [...ids]);
   }
   function markCollectionDeleted(playerId) {
     const ids = loadCollectionDeleted();
@@ -701,11 +713,10 @@
   const BL_CFG_KEY = "gcb-blacklist-cfg";
 
   function loadBlacklist() {
-    try { return JSON.parse(localStorage.getItem(BL_KEY) || "{}"); }
-    catch { return {}; }
+    return StorageUtils.getJSON(BL_KEY);
   }
   function saveBlacklist(bl) {
-    localStorage.setItem(BL_KEY, JSON.stringify(bl));
+    StorageUtils.setJSON(BL_KEY, bl);
   }
 
   function loadBlacklistConfig() {
@@ -742,14 +753,13 @@
   // look up card details when a native deletion is intercepted.
   const CARD_META_KEY = "gcb-card-meta";
   function loadCardMeta() {
-    try { return JSON.parse(localStorage.getItem(CARD_META_KEY) || "{}"); }
-    catch { return {}; }
+    return StorageUtils.getJSON(CARD_META_KEY);
   }
   function cacheCardMeta(card) {
     if (!card.id || !card.name) return;
     const meta = loadCardMeta();
     meta[card.id] = { name: card.name, rarity: card.rarity, country: card.country };
-    localStorage.setItem(CARD_META_KEY, JSON.stringify(meta));
+    StorageUtils.setJSON(CARD_META_KEY, meta);
   }
   function lookupCardMeta(playerId) {
     return loadCardMeta()[playerId] || null;
@@ -873,7 +883,7 @@
   // for a single frame when React renders the collection tab from RSC cache.
   function updateDeletedCssRules(ids) {
     if (!ids) ids = loadCollectionDeleted();
-    let el = document.getElementById("gcb-deleted-rules");
+    let el = DOMCache.get("gcb-deleted-rules");
     if (!el) {
       el = document.createElement("style");
       el.id = "gcb-deleted-rules";
@@ -881,7 +891,7 @@
     }
     if (!ids.size) { el.textContent = ""; return; }
     el.textContent = [...ids].map(id =>
-      `#tabs-content-collection .grid > .relative:has(a[href*="/users/${id}"]) { display: none !important; }`
+      `#tabs-content-collection .grid > .relative:has(a[href$="/users/${id}"], a[href*="/users/${id}/"]) { display: none !important; }`
     ).join("\n");
   }
 
@@ -893,15 +903,24 @@
   function applyCollectionDeletions() {
     const deleted = loadCollectionDeleted();
     if (!deleted.size) return;
+    let changed = false;
     for (const w of document.querySelectorAll(
       "#tabs-content-collection .grid > .relative",
     )) {
       const a = w.querySelector("a[href]");
       if (!a) continue;
       const m = a.href.match(/\/users\/(\d+)/);
-      if (m && deleted.has(parseInt(m[1]))) {
-        w.dataset.gcbDeleted = "true";
-      }
+      if (!m) continue;
+      const id = parseInt(m[1]);
+      if (!deleted.has(id)) continue;
+      // Card is present in the live collection — user re-acquired it.
+      // Remove from the deleted set so it stops being hidden.
+      deleted.delete(id);
+      changed = true;
+    }
+    if (changed) {
+      saveCollectionDeleted(deleted);
+      updateDeletedCssRules(deleted);
     }
   }
 
@@ -1193,7 +1212,7 @@
   }
 
   function renderHistory() {
-    const body = document.getElementById("gcb-hist-body");
+    const body = DOMCache.get("gcb-hist-body");
     if (!body) return;
     const history = loadHistory();
 
@@ -1212,7 +1231,7 @@
   // Prepend a single newly-scraped pack to the history body without
   // re-rendering the whole list. Preserves the user's scroll position.
   function prependPackToHistory(pack) {
-    const body = document.getElementById("gcb-hist-body");
+    const body = DOMCache.get("gcb-hist-body");
     if (!body) return;
     // Remove "No history yet" placeholder if present
     const placeholder = body.querySelector("p");
@@ -1221,7 +1240,7 @@
   }
 
   function showMythicNotification(mythicCards) {
-    const existing = document.getElementById("gcb-mythic-toast");
+    const existing = DOMCache.get("gcb-mythic-toast");
     if (existing) existing.remove();
 
     const toast = document.createElement("div");
@@ -1283,7 +1302,7 @@
     });
     document.addEventListener("mousedown", (e) => {
       if (mythicWindowOpen && !modal.contains(e.target)) {
-        const mainPanel = document.getElementById("gcb-panel");
+        const mainPanel = DOMCache.get("gcb-panel");
         if (!mainPanel?.contains(e.target)) {
           modal.style.display = "none";
           mythicWindowOpen = false;
@@ -1295,7 +1314,7 @@
   }
 
   function renderMythicWindow() {
-    const body = document.getElementById("gcb-mythic-body");
+    const body = DOMCache.get("gcb-mythic-body");
     if (!body) return;
     const history = loadHistory();
     const mythics = history.flatMap(pack =>
@@ -1313,7 +1332,7 @@
   }
 
   function prependMythicCards(cards) {
-    const body = document.getElementById("gcb-mythic-body");
+    const body = DOMCache.get("gcb-mythic-body");
     if (!body) return;
     const placeholder = body.querySelector("p");
     if (placeholder) placeholder.remove();
@@ -1357,7 +1376,7 @@
   }
 
   function renderBlacklistModal(onChangeCallback) {
-    const body = document.getElementById("gcb-bl-modal-body");
+    const body = DOMCache.get("gcb-bl-modal-body");
     if (!body) return;
     const bl = loadBlacklist();
     const entries = Object.entries(bl);
@@ -1433,7 +1452,7 @@
       }
     });
     modal.querySelector("#gcb-hist-mythic-btn").addEventListener("click", () => {
-      const mythicModal = document.getElementById("gcb-mythic-modal");
+      const mythicModal = DOMCache.get("gcb-mythic-modal");
       if (mythicModal) { mythicModal.style.display = "flex"; mythicWindowOpen = true; renderMythicWindow(); }
     });
 
@@ -1712,13 +1731,13 @@
     // ── Close ──
     panel.querySelector("#gcb-close").addEventListener("click", () => {
       panel.style.display = "none";
-      document.getElementById("gcb-fab").style.display = "flex";
+      DOMCache.get("gcb-fab").style.display = "flex";
     });
 
 
     // ── History ──
     panel.querySelector("#gcb-hist-open").addEventListener("click", () => {
-      const modal = document.getElementById("gcb-history-modal");
+      const modal = DOMCache.get("gcb-history-modal");
       if (!modal) return;
       renderHistory();
       const hasMythics = loadHistory().some(p => p.cards.some(c => c.rarity === "mythic"));
@@ -1967,7 +1986,7 @@
       }
 
       panel.querySelector("#gcb-bl-view").addEventListener("click", () => {
-        const blModal = document.getElementById("gcb-bl-modal");
+        const blModal = DOMCache.get("gcb-bl-modal");
         if (!blModal) return;
         renderBlacklistModal(refreshBlCount);
         blModal.style.display = "flex";
@@ -1977,7 +1996,7 @@
         if (confirm("Clear the blacklist? Repulled cards will no longer be auto-deleted.")) {
           saveBlacklist({});
           refreshBlCount();
-          const blModal = document.getElementById("gcb-bl-modal");
+          const blModal = DOMCache.get("gcb-bl-modal");
           if (blModal && blModal.style.display !== "none") renderBlacklistModal(refreshBlCount);
         }
       });
@@ -2001,7 +2020,7 @@
   let loadingAllCards = false;
 
   function setFilterStatus(msg, color = "#4b5563") {
-    const el = document.getElementById("gcb-filter-count");
+    const el = DOMCache.get("gcb-filter-count");
     if (el) {
       el.textContent = msg;
       el.style.color = color;
@@ -2023,7 +2042,7 @@
 
       // Inject opacity override early so each batch of cards becomes visible as it loads,
       // not all at once at the end. !important beats React's inline style="opacity:0".
-      if (!document.getElementById("gcb-card-visible")) {
+      if (!DOMCache.get("gcb-card-visible")) {
         const s = document.createElement("style");
         s.id = "gcb-card-visible";
         s.textContent =
@@ -2128,7 +2147,7 @@
       () => (btn.style.borderColor = "#3b82f640"),
     );
     btn.addEventListener("click", () => {
-      const panel = document.getElementById("gcb-panel");
+      const panel = DOMCache.get("gcb-panel");
       panel.style.display = "block";
       btn.style.display = "none";
     });
@@ -2138,7 +2157,7 @@
 
   function updatePackDisplay() {
     const count = readPackCount();
-    const el = document.getElementById("gcb-packs");
+    const el = DOMCache.get("gcb-packs");
     if (!el) return;
     if (count >= 0) {
       el.textContent = `🃏 ${count}/10`;
@@ -2147,7 +2166,7 @@
   }
 
   function refreshCountryList() {
-    const container = document.getElementById("gcb-countries");
+    const container = DOMCache.get("gcb-countries");
     if (!container) return;
     const countryMap = collectCountries();
 
@@ -2210,7 +2229,7 @@
 
   // Update collection filter section visibility when tabs change
   function syncFilterSection() {
-    const section = document.getElementById("gcb-filter-section");
+    const section = DOMCache.get("gcb-filter-section");
     if (!section) return;
     if (isCollectionTabActive()) {
       section.style.display = "block";
@@ -2265,7 +2284,7 @@
 
   // Re-clamp panel position on window resize so it can't go off-screen
   window.addEventListener("resize", () => {
-    const p = document.getElementById("gcb-panel");
+    const p = DOMCache.get("gcb-panel");
     if (!p || p.style.display === "none") return;
     const rect = p.getBoundingClientRect();
     const x = Math.max(
