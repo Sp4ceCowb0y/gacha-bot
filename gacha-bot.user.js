@@ -248,6 +248,16 @@
     clear() { this._c = {}; },
   };
 
+  // Returns a debounced wrapper that delays fn until ms ms after the last call.
+  // Replaces manual clearTimeout/setTimeout + timer variable patterns.
+  function debounce(fn, ms) {
+    let t = null;
+    return function () {
+      clearTimeout(t);
+      t = setTimeout(fn, ms);
+    };
+  }
+
   // ═══════════════════════════════════════════════════════════════
   //  PERSISTED STATE
   // ═══════════════════════════════════════════════════════════════
@@ -672,12 +682,17 @@
   }
 
   // Per-card state (favourited) persisted across modal reopens — keyed by player ID.
+  // _cardStatesCache avoids repeated JSON.parse on every buildCardTile call.
+  let _cardStatesCache = null;
   function loadCardStates() {
-    return StorageUtils.getJSON("gcb-card-states");
+    if (_cardStatesCache !== null) return _cardStatesCache;
+    _cardStatesCache = StorageUtils.getJSON("gcb-card-states");
+    return _cardStatesCache;
   }
   function saveCardState(id, patch) {
     const all = loadCardStates();
     all[id] = Object.assign(all[id] || {}, patch);
+    _cardStatesCache = all;
     StorageUtils.setJSON("gcb-card-states", all);
   }
 
@@ -904,9 +919,7 @@
     const deleted = loadCollectionDeleted();
     if (!deleted.size) return;
     let changed = false;
-    for (const w of document.querySelectorAll(
-      "#tabs-content-collection .grid > .relative",
-    )) {
+    for (const w of getCardWrappers()) {
       const a = w.querySelector("a[href]");
       if (!a) continue;
       const m = a.href.match(/\/users\/(\d+)/);
@@ -930,9 +943,7 @@
   // attribute, which React ignores.
   function applyCollectionFavStates() {
     const states = loadCardStates();
-    for (const w of document.querySelectorAll(
-      "#tabs-content-collection .grid > .relative",
-    )) {
+    for (const w of getCardWrappers()) {
       const a = w.querySelector("a[href]");
       if (!a) continue;
       const m = a.href.match(/\/users\/(\d+)/);
@@ -957,10 +968,7 @@
   // Stamps data-gcb-deleted instead of calling remove() — see applyCollectionDeletions
   // for why removing from React's managed DOM causes crashes.
   function removeCardFromCollectionDom(playerId) {
-    const wrappers = document.querySelectorAll(
-      "#tabs-content-collection .grid > .relative",
-    );
-    for (const w of wrappers) {
+    for (const w of getCardWrappers()) {
       if (w.querySelector(`a[href*="/users/${playerId}"]`)) {
         w.dataset.gcbDeleted = "true";
       }
@@ -969,9 +977,7 @@
 
   // Return the collection grid wrapper for a given player ID, or null if not loaded.
   function findCollectionCard(playerId) {
-    for (const w of document.querySelectorAll(
-      "#tabs-content-collection .grid > .relative",
-    )) {
+    for (const w of getCardWrappers()) {
       if (w.querySelector(`a[href*="/users/${playerId}"]`)) return w;
     }
     return null;
@@ -1213,19 +1219,20 @@
 
   function renderHistory() {
     const body = DOMCache.get("gcb-hist-body");
-    if (!body) return;
+    if (!body) return [];
     const history = loadHistory();
 
     if (!history.length) {
       body.innerHTML =
         '<p style="color:#4b5563;text-align:center;padding:48px 0;font-size:13px;">No history yet. Open some packs with Auto Open!</p>';
-      return;
+      return history;
     }
 
     body.innerHTML = "";
     for (let i = history.length - 1; i >= 0; i--) {
       body.appendChild(buildPackSection(history[i]));
     }
+    return history;
   }
 
   // Prepend a single newly-scraped pack to the history body without
@@ -1739,8 +1746,8 @@
     panel.querySelector("#gcb-hist-open").addEventListener("click", () => {
       const modal = DOMCache.get("gcb-history-modal");
       if (!modal) return;
-      renderHistory();
-      const hasMythics = loadHistory().some(p => p.cards.some(c => c.rarity === "mythic"));
+      const history = renderHistory();
+      const hasMythics = history.some(p => p.cards.some(c => c.rarity === "mythic"));
       const mythicBtn = modal.querySelector("#gcb-hist-mythic-btn");
       if (mythicBtn) mythicBtn.style.display = hasMythics ? "inline-flex" : "none";
       modal.style.display = "flex";
@@ -2265,16 +2272,12 @@
   }
 
   // MutationObserver — debounced so rapid DOM mutations during page load don't cascade
-  let debounceTimer = null;
-  const observer = new MutationObserver(() => {
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-      tryStart();
-      updatePackDisplay();
-      syncFilterSection();
-      tryScrapePack();
-    }, 300);
-  });
+  const observer = new MutationObserver(debounce(() => {
+    tryStart();
+    updatePackDisplay();
+    syncFilterSection();
+    tryScrapePack();
+  }, 300));
   observer.observe(document.body, {
     childList: true,
     subtree: true,
