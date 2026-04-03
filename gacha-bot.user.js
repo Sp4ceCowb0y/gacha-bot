@@ -494,6 +494,7 @@
   let currentPackFp = null;
   let overlayGoneTimer = null; // debounce for overlay-close detection
   let historyWindowOpen = false; // tracks whether the history panel is visible
+  let mythicWindowOpen = false;  // tracks whether the mythic pulls panel is visible
 
   function packFingerprint(cards) {
     return cards
@@ -554,6 +555,11 @@
     saveHistory(hist);
     await runAutoDelete(cards, packTs); // wait so deleted state is stamped before building tiles
     if (historyWindowOpen) prependPackToHistory({ timestamp: packTs, cards });
+    const mythics = cards.filter(c => c.rarity === "mythic");
+    if (mythics.length) {
+      showMythicNotification(mythics);
+      if (mythicWindowOpen) prependMythicCards(mythics);
+    }
   }
 
   function scrapeOverlayCards() {
@@ -586,7 +592,11 @@
       );
       const avatar = `https://a.ppy.sh/${id}`;
 
-      if (name) cards.push({ id, name, rarity, country, avatar, shiny });
+      if (name) {
+        const card = { id, name, rarity, country, avatar, shiny };
+        cacheCardMeta(card);
+        cards.push(card);
+      }
     }
     return cards;
   }
@@ -725,6 +735,30 @@
     saveBlacklist(bl);
   }
 
+  // ─── Card metadata cache ───────────────────────────────────────────────────
+  // Persists { name, rarity, country } keyed by player ID so the fetch hook can
+  // look up card details when a native deletion is intercepted.
+  const CARD_META_KEY = "gcb-card-meta";
+  function loadCardMeta() {
+    try { return JSON.parse(localStorage.getItem(CARD_META_KEY) || "{}"); }
+    catch { return {}; }
+  }
+  function cacheCardMeta(card) {
+    if (!card.id || !card.name) return;
+    const meta = loadCardMeta();
+    meta[card.id] = { name: card.name, rarity: card.rarity, country: card.country };
+    localStorage.setItem(CARD_META_KEY, JSON.stringify(meta));
+  }
+  function lookupCardMeta(playerId) {
+    return loadCardMeta()[playerId] || null;
+  }
+
+  function removeFromBlacklist(id) {
+    const bl = loadBlacklist();
+    delete bl[id];
+    saveBlacklist(bl);
+  }
+
   // Returns true if this card ID is in the blacklist AND blacklisting is enabled.
   function isBlacklisted(cardId) {
     if (!loadBlacklistConfig().enabled) return false;
@@ -802,6 +836,35 @@
     }
   }
   // ──────────────────────────────────────────────────────────────────────────
+
+  // Intercept native DELETE /api/collection requests so that cards deleted
+  // through the site's own UI are still marked and blacklisted by our script.
+  function installFetchHook() {
+    const origFetch = window.fetch;
+    window.fetch = async function (...args) {
+      const res = await origFetch.apply(this, args);
+      try {
+        const [input, init] = args;
+        const url = typeof input === "string" ? input : input?.url || "";
+        const method = (init?.method || (input?.method) || "GET").toUpperCase();
+        if (method === "DELETE" && url.includes("/api/collection") && res.ok) {
+          const body = init?.body || input?.body;
+          if (body) {
+            const parsed = JSON.parse(typeof body === "string" ? body : await new Response(body).text());
+            for (const id of parsed.playerIds || []) {
+              markCollectionDeleted(id);
+              const meta = lookupCardMeta(id);
+              if (meta) addToBlacklist({ id, ...meta });
+            }
+          }
+        }
+      } catch {
+        // never break the original request
+      }
+      return res;
+    };
+  }
+  installFetchHook();
 
   // Injects/updates a <style> with :has() rules for every deleted player ID.
   // CSS is applied by the browser before paint, so cards are never visible even
@@ -922,6 +985,7 @@
   }
 
   function buildCardTile(card, packTs) {
+    cacheCardMeta(card);
     const rarityColor = RARITY_COLORS[card.rarity] || "#9ca3af";
     // fav is shared per player ID; deleted is per pack-card instance so the same
     // player in a different pack is not affected.
@@ -1144,6 +1208,176 @@
     body.insertBefore(buildPackSection(pack), body.firstChild);
   }
 
+  function showMythicNotification(mythicCards) {
+    const existing = document.getElementById("gcb-mythic-toast");
+    if (existing) existing.remove();
+
+    const toast = document.createElement("div");
+    toast.id = "gcb-mythic-toast";
+    toast.style.cssText = `
+      position:fixed; top:60px; left:50%; transform:translateX(-50%);
+      z-index:99999; background:linear-gradient(135deg,#1a0505 0%,#2d0a0a 100%);
+      border:2px solid rgba(239,68,68,0.8); border-radius:16px;
+      padding:18px 28px; min-width:260px; max-width:480px;
+      text-align:center; cursor:pointer;
+    `;
+    const names = mythicCards.map(c => `<span style="color:#f9fafb;font-weight:700;">${c.name}</span>`).join(", ");
+    toast.innerHTML = `
+      <div id="gcb-mythic-toast-title" style="font-size:20px;font-weight:900;letter-spacing:4px;
+           text-transform:uppercase;color:#ef4444;margin-bottom:8px;">
+        ⚠ MYTHIC PULL ⚠
+      </div>
+      <div style="font-size:13px;color:#9ca3af;line-height:1.6;">${names}</div>
+      <div style="margin-top:10px;font-size:10px;color:#4b5563;letter-spacing:1px;">Click to dismiss</div>
+    `;
+
+    function dismiss() {
+      toast.classList.add("gcb-closing");
+      toast.addEventListener("animationend", () => toast.remove(), { once: true });
+    }
+    toast.addEventListener("click", dismiss);
+    const timer = setTimeout(dismiss, 6000);
+    toast.addEventListener("click", () => clearTimeout(timer), { once: true });
+
+    document.body.appendChild(toast);
+  }
+
+  function buildMythicModal() {
+    const modal = document.createElement("div");
+    modal.id = "gcb-mythic-modal";
+    modal.style.cssText = `
+      display:none; position:fixed; right:302px; top:160px; z-index:20000;
+      width:780px; max-height:80vh;
+      background:#0a0f1a; border:1px solid rgba(239,68,68,0.35); border-radius:16px;
+      overflow:hidden; flex-direction:column;
+      box-shadow:0 8px 32px rgba(239,68,68,0.15), 0 4px 16px rgba(0,0,0,0.7);
+    `;
+    modal.innerHTML = `
+      <div id="gcb-mythic-header" style="display:flex;align-items:center;justify-content:space-between;
+           padding:14px 20px;background:#0d1525;border-bottom:1px solid rgba(239,68,68,0.2);
+           cursor:grab;user-select:none;flex-shrink:0;">
+        <span style="font-weight:800;font-size:12px;letter-spacing:3px;
+             color:#ef4444;text-transform:uppercase;">Mythic Pulls</span>
+        <button id="gcb-mythic-close" style="background:none;border:none;
+            color:#4b5563;cursor:pointer;font-size:15px;line-height:1;padding:0;">✕</button>
+      </div>
+      <div id="gcb-mythic-body" style="padding:18px 20px;overflow-y:auto;flex:1;"></div>
+    `;
+    document.body.appendChild(modal);
+
+    modal.querySelector("#gcb-mythic-close").addEventListener("click", () => {
+      modal.style.display = "none";
+      mythicWindowOpen = false;
+    });
+    document.addEventListener("mousedown", (e) => {
+      if (mythicWindowOpen && !modal.contains(e.target)) {
+        const mainPanel = document.getElementById("gcb-panel");
+        if (!mainPanel?.contains(e.target)) {
+          modal.style.display = "none";
+          mythicWindowOpen = false;
+        }
+      }
+    });
+    makeDraggable(modal, modal.querySelector("#gcb-mythic-header"));
+    return modal;
+  }
+
+  function renderMythicWindow() {
+    const body = document.getElementById("gcb-mythic-body");
+    if (!body) return;
+    const history = loadHistory();
+    const mythics = history.flatMap(pack =>
+      pack.cards.filter(c => c.rarity === "mythic").map(c => ({ ...c, packTs: pack.timestamp }))
+    ).reverse();
+    if (!mythics.length) {
+      body.innerHTML = '<p style="color:#4b5563;text-align:center;padding:48px 0;font-size:13px;">No mythic cards pulled yet.</p>';
+      return;
+    }
+    body.innerHTML = "";
+    const grid = document.createElement("div");
+    grid.style.cssText = "display:flex;flex-wrap:wrap;gap:8px;";
+    for (const card of mythics) grid.appendChild(buildCardTile(card, card.packTs));
+    body.appendChild(grid);
+  }
+
+  function prependMythicCards(cards) {
+    const body = document.getElementById("gcb-mythic-body");
+    if (!body) return;
+    const placeholder = body.querySelector("p");
+    if (placeholder) placeholder.remove();
+    let grid = body.querySelector(".gcb-mythic-grid");
+    if (!grid) {
+      grid = document.createElement("div");
+      grid.className = "gcb-mythic-grid";
+      grid.style.cssText = "display:flex;flex-wrap:wrap;gap:8px;";
+      body.prepend(grid);
+    }
+    for (const card of cards) grid.prepend(buildCardTile(card, Date.now()));
+  }
+
+  function buildBlacklistModal() {
+    const modal = document.createElement("div");
+    modal.id = "gcb-bl-modal";
+    modal.style.cssText = `
+      display:none; position:fixed; right:302px; top:260px; z-index:20001;
+      width:320px; max-height:70vh;
+      background:#0a0f1a; border:1px solid #1f2937; border-radius:14px;
+      overflow:hidden; flex-direction:column;
+      box-shadow:0 8px 32px rgba(0,0,0,0.7);
+    `;
+    modal.innerHTML = `
+      <div id="gcb-bl-modal-header" style="display:flex;align-items:center;justify-content:space-between;
+           padding:12px 16px;background:#0d1525;border-bottom:1px solid #1f2937;
+           cursor:grab;user-select:none;flex-shrink:0;">
+        <span style="font-weight:800;font-size:11px;letter-spacing:2.5px;color:#9ca3af;text-transform:uppercase;">Blacklist</span>
+        <button id="gcb-bl-modal-close" style="background:none;border:none;
+            color:#4b5563;cursor:pointer;font-size:15px;line-height:1;padding:0;">✕</button>
+      </div>
+      <div id="gcb-bl-modal-body" style="padding:10px 14px;overflow-y:auto;flex:1;"></div>
+    `;
+    document.body.appendChild(modal);
+
+    modal.querySelector("#gcb-bl-modal-close").addEventListener("click", () => {
+      modal.style.display = "none";
+    });
+    makeDraggable(modal, modal.querySelector("#gcb-bl-modal-header"));
+    return modal;
+  }
+
+  function renderBlacklistModal(onChangeCallback) {
+    const body = document.getElementById("gcb-bl-modal-body");
+    if (!body) return;
+    const bl = loadBlacklist();
+    const entries = Object.entries(bl);
+    if (!entries.length) {
+      body.innerHTML = '<p style="color:#4b5563;text-align:center;padding:24px 0;font-size:12px;">Blacklist is empty.</p>';
+      return;
+    }
+    body.innerHTML = "";
+    for (const [id, data] of entries) {
+      const color = RARITY_COLORS[data.rarity] || "#9ca3af";
+      const row = document.createElement("div");
+      row.style.cssText = "display:flex;align-items:center;justify-content:space-between;padding:5px 4px;border-bottom:1px solid #111827;";
+      row.innerHTML = `
+        <div style="display:flex;align-items:center;gap:6px;overflow:hidden;">
+          <span style="width:7px;height:7px;border-radius:50%;background:${color};flex-shrink:0;display:inline-block;"></span>
+          <span style="font-size:12px;color:#d1d5db;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${data.name}">${data.name}</span>
+        </div>
+        <button data-id="${id}" style="font-size:10px;color:#ef4444;background:none;border:1px solid #ef444430;
+            border-radius:5px;padding:1px 7px;cursor:pointer;flex-shrink:0;margin-left:8px;">✕</button>
+      `;
+      row.querySelector("button").addEventListener("click", () => {
+        removeFromBlacklist(id);
+        row.remove();
+        if (!body.children.length) {
+          body.innerHTML = '<p style="color:#4b5563;text-align:center;padding:24px 0;font-size:12px;">Blacklist is empty.</p>';
+        }
+        if (onChangeCallback) onChangeCallback();
+      });
+      body.appendChild(row);
+    }
+  }
+
   function buildHistoryModal() {
     const modal = document.createElement("div");
     modal.id = "gcb-history-modal";
@@ -1245,6 +1479,33 @@
                 display: none !important;
             }
 
+            @keyframes gcb-mythic-in {
+                from { opacity:0; transform:scale(0.85) translateY(-20px); }
+                to   { opacity:1; transform:scale(1) translateY(0); }
+            }
+            @keyframes gcb-mythic-out {
+                from { opacity:1; transform:scale(1); }
+                to   { opacity:0; transform:scale(0.9) translateY(-10px); }
+            }
+            @keyframes gcb-mythic-glow {
+                0%,100% { box-shadow: 0 0 30px 8px rgba(239,68,68,0.55), 0 0 80px 20px rgba(239,68,68,0.2); }
+                50%      { box-shadow: 0 0 50px 16px rgba(239,68,68,0.8), 0 0 120px 40px rgba(239,68,68,0.35); }
+            }
+            @keyframes gcb-mythic-text {
+                0%,100% { text-shadow: 0 0 12px #ef4444, 0 0 30px #ef4444; }
+                50%      { text-shadow: 0 0 24px #fff, 0 0 60px #ef4444; }
+            }
+            #gcb-mythic-toast {
+                animation: gcb-mythic-in 0.35s cubic-bezier(0.23,1,0.32,1) forwards,
+                           gcb-mythic-glow 1.4s ease-in-out infinite;
+            }
+            #gcb-mythic-toast.gcb-closing {
+                animation: gcb-mythic-out 0.3s ease-in forwards !important;
+            }
+            #gcb-mythic-toast-title {
+                animation: gcb-mythic-text 1.4s ease-in-out infinite;
+            }
+
             /* Correct fav button appearance when collection tab remounts from RSC cache.
                React controls button classes; we set data-gcb-fav on the wrapper, which
                React ignores, so these overrides survive re-renders. */
@@ -1295,6 +1556,7 @@
             ">
                 <span style="font-weight:800;font-size:12px;letter-spacing:3px;color:#3b82f6;text-transform:uppercase;">osu<span style="color:#f9fafb">!</span>gacha</span>
                 <div style="display:flex;align-items:center;gap:8px;">
+                    <button id="gcb-mythic-open" style="background:none;border:none;color:#ef444480;cursor:pointer;font-size:14px;line-height:1;padding:0;" title="Mythic Pulls">⬤</button>
                     <button id="gcb-hist-open" style="background:none;border:none;color:#4b5563;cursor:pointer;font-size:14px;line-height:1;padding:0;" title="Pack History">🕓</button>
                     <button id="gcb-close" style="background:none;border:none;color:#4b5563;cursor:pointer;font-size:15px;line-height:1;padding:0;" title="Close">✕</button>
                 </div>
@@ -1405,7 +1667,10 @@
                             <div id="gcb-bl-rarities" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px;"></div>
                             <div style="display:flex;align-items:center;justify-content:space-between;">
                                 <span id="gcb-bl-count" style="font-size:10px;color:#4b5563;">0 remembered</span>
-                                <button id="gcb-bl-clear" style="font-size:10px;color:#ef4444;background:none;border:1px solid #ef444440;border-radius:6px;padding:2px 8px;cursor:pointer;">Clear</button>
+                                <div style="display:flex;gap:5px;">
+                                    <button id="gcb-bl-view" style="font-size:10px;color:#60a5fa;background:none;border:1px solid #60a5fa40;border-radius:6px;padding:2px 8px;cursor:pointer;">View</button>
+                                    <button id="gcb-bl-clear" style="font-size:10px;color:#ef4444;background:none;border:1px solid #ef444440;border-radius:6px;padding:2px 8px;cursor:pointer;">Clear</button>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -1420,6 +1685,15 @@
     panel.querySelector("#gcb-close").addEventListener("click", () => {
       panel.style.display = "none";
       document.getElementById("gcb-fab").style.display = "flex";
+    });
+
+    // ── Mythic window ──
+    panel.querySelector("#gcb-mythic-open").addEventListener("click", () => {
+      const modal = document.getElementById("gcb-mythic-modal");
+      if (!modal) return;
+      renderMythicWindow();
+      modal.style.display = "flex";
+      mythicWindowOpen = true;
     });
 
     // ── History ──
@@ -1669,10 +1943,19 @@
         blRaritiesEl.appendChild(btn);
       }
 
+      panel.querySelector("#gcb-bl-view").addEventListener("click", () => {
+        const blModal = document.getElementById("gcb-bl-modal");
+        if (!blModal) return;
+        renderBlacklistModal(refreshBlCount);
+        blModal.style.display = "flex";
+      });
+
       panel.querySelector("#gcb-bl-clear").addEventListener("click", () => {
         if (confirm("Clear the blacklist? Repulled cards will no longer be auto-deleted.")) {
           saveBlacklist({});
           refreshBlCount();
+          const blModal = document.getElementById("gcb-bl-modal");
+          if (blModal && blModal.style.display !== "none") renderBlacklistModal(refreshBlCount);
         }
       });
     })();
@@ -1897,6 +2180,8 @@
   const panel = buildPanel();
   buildFab();
   buildHistoryModal();
+  buildMythicModal();
+  buildBlacklistModal();
 
   let collectionTabWasSeen = false;
 
