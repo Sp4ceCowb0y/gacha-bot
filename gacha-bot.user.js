@@ -559,6 +559,8 @@
     if (mythics.length) {
       showMythicNotification(mythics);
       if (mythicWindowOpen) prependMythicCards(mythics);
+      const mythicBtn = document.getElementById("gcb-hist-mythic-btn");
+      if (mythicBtn) mythicBtn.style.display = "inline-flex";
     }
   }
 
@@ -1395,7 +1397,7 @@
                  cursor:grab;user-select:none;flex-shrink:0;">
                 <span style="font-weight:800;font-size:12px;letter-spacing:3px;
                      color:#3b82f6;text-transform:uppercase;">Pack History</span>
-                <button id="gcb-hist-mythic-btn" class="gcb-mythic-badge">✦ Mythic Pulls</button>
+                <button id="gcb-hist-mythic-btn" class="gcb-mythic-badge" style="display:none;">✦ Mythic Pulls</button>
                 <div style="display:flex;gap:10px;align-items:center;">
                     <button id="gcb-hist-clear" style="font-size:11px;color:#ef4444;background:none;
                         border:1px solid #ef444440;border-radius:6px;padding:3px 10px;cursor:pointer;">
@@ -1573,7 +1575,6 @@
             ">
                 <span style="font-weight:800;font-size:12px;letter-spacing:3px;color:#3b82f6;text-transform:uppercase;">osu<span style="color:#f9fafb">!</span>gacha</span>
                 <div style="display:flex;align-items:center;gap:8px;">
-                    <button id="gcb-mythic-open" style="background:none;border:none;color:#ef444480;cursor:pointer;font-size:14px;line-height:1;padding:0;" title="Mythic Pulls">⬤</button>
                     <button id="gcb-hist-open" style="background:none;border:none;color:#4b5563;cursor:pointer;font-size:14px;line-height:1;padding:0;" title="Pack History">🕓</button>
                     <button id="gcb-close" style="background:none;border:none;color:#4b5563;cursor:pointer;font-size:15px;line-height:1;padding:0;" title="Close">✕</button>
                 </div>
@@ -1704,20 +1705,15 @@
       document.getElementById("gcb-fab").style.display = "flex";
     });
 
-    // ── Mythic window ──
-    panel.querySelector("#gcb-mythic-open").addEventListener("click", () => {
-      const modal = document.getElementById("gcb-mythic-modal");
-      if (!modal) return;
-      renderMythicWindow();
-      modal.style.display = "flex";
-      mythicWindowOpen = true;
-    });
 
     // ── History ──
     panel.querySelector("#gcb-hist-open").addEventListener("click", () => {
       const modal = document.getElementById("gcb-history-modal");
       if (!modal) return;
       renderHistory();
+      const hasMythics = loadHistory().some(p => p.cards.some(c => c.rarity === "mythic"));
+      const mythicBtn = modal.querySelector("#gcb-hist-mythic-btn");
+      if (mythicBtn) mythicBtn.style.display = hasMythics ? "inline-flex" : "none";
       modal.style.display = "flex";
       historyWindowOpen = true;
     });
