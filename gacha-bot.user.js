@@ -252,9 +252,9 @@
   // Replaces manual clearTimeout/setTimeout + timer variable patterns.
   function debounce(fn, ms) {
     let t = null;
-    return function () {
+    return function (...args) {
       clearTimeout(t);
-      t = setTimeout(fn, ms);
+      t = setTimeout(() => fn(...args), ms);
     };
   }
 
@@ -690,10 +690,11 @@
     return _cardStatesCache;
   }
   function saveCardState(id, patch) {
+    _cardStatesCache = null; // invalidate so loadCardStates re-reads from storage
     const all = loadCardStates();
     all[id] = Object.assign(all[id] || {}, patch);
-    _cardStatesCache = all;
     StorageUtils.setJSON("gcb-card-states", all);
+    _cardStatesCache = all;
   }
 
   // Per-pack-card deleted state — keyed by `${packTimestamp}_${cardId}`.
@@ -1259,15 +1260,22 @@
       padding:18px 28px; min-width:260px; max-width:480px;
       text-align:center; cursor:pointer;
     `;
-    const names = mythicCards.map(c => `<span style="color:#f9fafb;font-weight:700;">${c.name}</span>`).join(", ");
     toast.innerHTML = `
       <div id="gcb-mythic-toast-title" style="font-size:20px;font-weight:900;letter-spacing:4px;
            text-transform:uppercase;color:#ef4444;margin-bottom:8px;">
         ⚠ MYTHIC PULL ⚠
       </div>
-      <div style="font-size:13px;color:#9ca3af;line-height:1.6;">${names}</div>
+      <div id="gcb-mythic-toast-names" style="font-size:13px;color:#9ca3af;line-height:1.6;"></div>
       <div style="margin-top:10px;font-size:10px;color:#4b5563;letter-spacing:1px;">Click to dismiss</div>
     `;
+    const namesEl = toast.querySelector("#gcb-mythic-toast-names");
+    mythicCards.forEach((c, i) => {
+      if (i > 0) namesEl.appendChild(document.createTextNode(", "));
+      const span = document.createElement("span");
+      span.style.cssText = "color:#f9fafb;font-weight:700;";
+      span.textContent = c.name;
+      namesEl.appendChild(span);
+    });
 
     function dismiss() {
       toast.classList.add("gcb-closing");
