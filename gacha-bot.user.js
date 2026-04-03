@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GachaBot (Beta)
 // @namespace    http://tampermonkey.net/
-// @version      1.32-beta
+// @version      1.33-beta
 // @description  Auto-open packs + collection filter panel for gacha.miz.to
 // @author       Sp4ceCowb0y
 // @match        https://gacha.miz.to/*
@@ -13,6 +13,12 @@
 // ───────────────────────────────────────────────────────────────────
 //  CHANGELOG
 // ───────────────────────────────────────────────────────────────────
+//  v1.33 Bump version to trigger Tampermonkey auto-update (v1.32 shipped without
+//        a version increment so existing installs did not detect the update).
+//
+//  v1.32 Fix: rename "Auto Open" label to "Auto-Open" for consistency with
+//        Auto-Delete. Add README with feature overview and installation guide.
+//
 //  v1.31 Fix: auto-deleted cards not showing DELETED banner in real-time history
 //        updates. Root cause: runAutoDelete was fire-and-forget so the deletion
 //        API calls and saveDeletedInstance hadn't finished by the time
