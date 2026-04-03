@@ -918,9 +918,19 @@
       if (!a) continue;
       const m = a.href.match(/\/users\/(\d+)/);
       if (!m) continue;
-      const stored = states[parseInt(m[1])];
-      if (stored?.fav === true) w.dataset.gcbFav = "true";
-      else if (stored?.fav === false) w.dataset.gcbFav = "false";
+      const id = parseInt(m[1]);
+      const stored = states[id];
+      // Native button title is "Unfavorite" when the card is actually favourited.
+      const nativeFav = !!w.querySelector('button[title="Unfavorite"]');
+      // If our stored state disagrees with the site, trust the site and heal the record.
+      if (stored?.fav === false && nativeFav) {
+        saveCardState(id, { fav: true });
+        w.dataset.gcbFav = "true";
+      } else if (stored?.fav === true) {
+        w.dataset.gcbFav = "true";
+      } else if (stored?.fav === false) {
+        w.dataset.gcbFav = "false";
+      }
     }
   }
 
