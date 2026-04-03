@@ -2,8 +2,6 @@
 
 > Tampermonkey userscript for [gacha.miz.to](https://gacha.miz.to) — auto-opens packs and adds a collection filter panel.
 
-**Version:** 1.31 · **Author:** Sp4ceCowb0y
-
 ---
 
 ## Installation
