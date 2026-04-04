@@ -463,6 +463,21 @@
     );
   }
 
+  // Card metadata cache — avoids repeating querySelectorAll for country/rarity/shiny on
+  // every filter pass. WeakMap keys are automatically GC'd when wrapper elements are removed.
+  let _cardMeta = new WeakMap();
+  function getCardMeta(wrapper) {
+    if (_cardMeta.has(wrapper)) return _cardMeta.get(wrapper);
+    const meta = {
+      country: getCountryCode(wrapper),
+      rarity: getRarity(wrapper),
+      shiny: isShiny(wrapper),
+    };
+    _cardMeta.set(wrapper, meta);
+    return meta;
+  }
+  function clearCardMetaCache() { _cardMeta = new WeakMap(); }
+
   function getCountryCode(card) {
     const img = card.querySelector('img[src*="flag-icons/flags/4x3/"]');
     if (!img) return null;
@@ -492,15 +507,16 @@
       // CSS handles their display:none via [data-gcb-deleted="true"] { display:none !important }.
       if (w.dataset.gcbDeleted === "true") continue;
       total++;
-      const country = getCountryCode(w);
-      const rarity = getRarity(w);
-      const shiny = isShiny(w);
+      // getCardMeta caches country/rarity/shiny per wrapper — DOM queries run once per card
+      // across all filter applications, not once per card per filter apply.
+      const { country, rarity, shiny } = getCardMeta(w);
       const countryOk = !country || filterState.countries.has(country);
       const rarityOk =
         filterState.rarities.size === 0 ||
         (rarity && filterState.rarities.has(rarity));
       const shinyOk = !filterState.shinyOnly || shiny;
-      const isFav = w.dataset.gcbFav === "true" || !!w.querySelector('button[class*="78350f"]');
+      // data-gcb-fav is stamped by applyCollectionFavStates() before filters run — no DOM query needed.
+      const isFav = w.dataset.gcbFav === "true";
       const favOk =
         filterState.favsMode === "only" ? isFav :
         filterState.favsMode === "hide" ? !isFav :
@@ -2045,6 +2061,9 @@
   async function loadAllCards() {
     if (loadingAllCards) return;
     loadingAllCards = true;
+    // Clear per-card caches so a fresh load doesn't serve stale DOM-extracted metadata.
+    clearCardMetaCache();
+    _lastCountryCardCount = 0;
     setFilterStatus("Waiting for cards...", "#60a5fa");
     try {
       // Wait up to 8s for the first "Load more" button to appear (cards may still be rendering)
@@ -2091,7 +2110,7 @@
 
         if (getCardWrappers().length === before) break;
         await sleep(200);
-        refreshCountryList();
+        refreshCountryList(true); // incremental — only scan newly added cards
         applyFilters();
         loadMore = findLoadMoreButton();
       }
@@ -2180,10 +2199,33 @@
     }
   }
 
-  function refreshCountryList() {
+  // Tracks how many wrappers have already been scanned for country codes.
+  // Incremental mode skips already-scanned cards — O(newCards) instead of O(allCards) per batch.
+  let _lastCountryCardCount = 0;
+
+  // incrementalOnly=true: only scan cards added since last call (used during batch loading).
+  // incrementalOnly=false (default): full scan, used on tab activation and load completion.
+  function refreshCountryList(incrementalOnly = false) {
     const container = DOMCache.get("gcb-countries");
     if (!container) return;
-    const countryMap = collectCountries();
+
+    let countryMap;
+    if (incrementalOnly) {
+      const wrappers = [...getCardWrappers()];
+      const newWrappers = wrappers.slice(_lastCountryCardCount);
+      _lastCountryCardCount = wrappers.length;
+      if (!newWrappers.length) return;
+      countryMap = new Map();
+      for (const w of newWrappers) {
+        const img = w.querySelector('img[src*="flag-icons/flags/4x3/"]');
+        if (!img) continue;
+        const m = img.src.match(/flags\/4x3\/([a-z]+)\.svg/);
+        if (m) countryMap.set(m[1], img.src);
+      }
+    } else {
+      _lastCountryCardCount = getCardWrappers().length;
+      countryMap = collectCountries();
+    }
 
     for (const [code, src] of countryMap) {
       if (container.querySelector(`[data-code="${code}"]`)) continue;
@@ -2264,6 +2306,9 @@
     } else {
       section.style.display = "none";
       collectionTabWasSeen = false;
+      // Clear metadata cache — DOM may differ on next tab activation (React may remount cards).
+      clearCardMetaCache();
+      _lastCountryCardCount = 0;
     }
   }
 
