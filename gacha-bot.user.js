@@ -258,6 +258,19 @@
     };
   }
 
+  // Schedules fn to run during browser idle time (with a 200 ms forced timeout).
+  // Falls back to setTimeout(50) in browsers without requestIdleCallback.
+  // Returns a handle that can be passed to cancelIdle().
+  function scheduleIdle(fn) {
+    return typeof requestIdleCallback === "function"
+      ? requestIdleCallback(fn, { timeout: 200 })
+      : setTimeout(fn, 50);
+  }
+  function cancelIdle(handle) {
+    if (typeof cancelIdleCallback === "function") cancelIdleCallback(handle);
+    else clearTimeout(handle);
+  }
+
   // ═══════════════════════════════════════════════════════════════
   //  PERSISTED STATE
   // ═══════════════════════════════════════════════════════════════
@@ -477,6 +490,24 @@
     return meta;
   }
   function clearCardMetaCache() { _cardMeta = new WeakMap(); }
+
+  // Coalescing idle filter scheduler — ensures at most one pending applyFilters call
+  // is queued at a time. Subsequent calls before the idle callback fires are no-ops.
+  // Use cancelIdleFilter() + applyFilters() to flush synchronously when needed.
+  let _idleFilterHandle = null;
+  function scheduleIdleFilter() {
+    if (_idleFilterHandle !== null) return;
+    _idleFilterHandle = scheduleIdle(() => {
+      _idleFilterHandle = null;
+      applyFilters();
+    });
+  }
+  function cancelIdleFilter() {
+    if (_idleFilterHandle !== null) {
+      cancelIdle(_idleFilterHandle);
+      _idleFilterHandle = null;
+    }
+  }
 
   function getCountryCode(card) {
     const img = card.querySelector('img[src*="flag-icons/flags/4x3/"]');
@@ -2110,13 +2141,18 @@
 
         if (getCardWrappers().length === before) break;
         await sleep(200);
-        refreshCountryList(true); // incremental — only scan newly added cards
+        // Deletions must be stamped synchronously — CSS and applyFilters both depend on the attribute.
         applyCollectionDeletions();
-        applyFilters();
+        // Country scan is fast (new wrappers only) — keep it synchronous so _lastCountryCardCount stays consistent.
+        refreshCountryList(true);
+        // Style mutations (display:none) are deferred to idle time — coalesced so only one pending call at a time.
+        scheduleIdleFilter();
         loadMore = findLoadMoreButton();
       }
     } finally {
       loadingAllCards = false;
+      // Cancel any pending idle filter and run a final synchronous pass for accurate end state.
+      cancelIdleFilter();
       refreshCountryList();
       applyCollectionDeletions();
       applyFilters();
@@ -2308,6 +2344,8 @@
     } else {
       section.style.display = "none";
       collectionTabWasSeen = false;
+      // Cancel any pending idle filter — DOM is no longer visible, stale run would be wasteful.
+      cancelIdleFilter();
       // Clear metadata cache — DOM may differ on next tab activation (React may remount cards).
       clearCardMetaCache();
       _lastCountryCardCount = 0;
