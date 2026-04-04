@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GachaBot
 // @namespace    http://tampermonkey.net/
-// @version      1.33
+// @version      1.34
 // @description  Auto-open packs + collection filter panel for gacha.miz.to
 // @author       Sp4ceCowb0y
 // @match        https://gacha.miz.to/*
@@ -13,6 +13,26 @@
 // ───────────────────────────────────────────────────────────────────
 //  CHANGELOG
 // ───────────────────────────────────────────────────────────────────
+//  v1.34 Perf: remove CSS :has() rules injected by updateDeletedCssRules(). Firefox's
+//        relative selector invalidation re-evaluated every :has() rule on every DOM
+//        mutation, causing 5 × ~10-second LongTasks during loadAllCards() (confirmed
+//        via Firefox profiler: ~70% CPU in style::invalidation::element::relative_selector::*).
+//        Fix: rely solely on the existing [data-gcb-deleted="true"] { display:none }
+//        attribute selector in injectStyles() — no relative-selector invalidation cost.
+//        Flash prevention (v1.22) is replaced by: (a) hiding the collection grid while
+//        applyCollectionDeletions() runs synchronously on tab activation, and (b) a
+//        MutationObserver that pre-stamps data-gcb-deleted on cards React adds to the
+//        grid while the tab is active (MutationObserver callbacks fire before paint).
+//        Perf: history window now opens immediately — modal is shown before DOM is
+//        built, first 5 packs render synchronously, remaining packs render in async
+//        batches of 8. All card images (avatar + flag) use loading="lazy" so only
+//        visible images load on open, eliminating the ~75k parallel image loads.
+//        Add: clicking anywhere outside the history panel now closes it.
+//        Add: "Remember Deleted" blacklist in the Auto-Delete panel. When enabled,
+//        deleted cards matching the configured rarities (default: legendary + epic)
+//        are stored in gcb-blacklist and auto-deleted whenever they are repulled,
+//        independently of the rarity/nationality rules.
+//
 //  v1.33 Bump version to trigger Tampermonkey auto-update (v1.32 shipped without
 //        a version increment so existing installs did not detect the update).
 //
@@ -199,14 +219,118 @@
   const POLL_RATE_MS = 300;
   const FALLBACK_CHECK_MS = 5 * 1000;
 
-  const RARITIES = ["legendary", "epic", "rare", "uncommon", "common"];
+  const RARITIES = ["mythic", "legendary", "epic", "rare", "uncommon", "common"];
   const RARITY_COLORS = {
+    mythic: "#ef4444",
     legendary: "#fcd34d",
     epic: "#c084fc",
     rare: "#60a5fa",
     uncommon: "#4ade80",
     common: "#9ca3af",
   };
+
+  // ═══════════════════════════════════════════════════════════════
+  //  UTILITIES
+  // ═══════════════════════════════════════════════════════════════
+
+  // Thin wrapper around localStorage JSON read/write.
+  // getJSON returns `fallback` when the key is absent or the stored value is
+  // unparseable, so callers never need their own try/catch.
+  const StorageUtils = {
+    getJSON(key, fallback = {}) {
+      try {
+        const raw = localStorage.getItem(key);
+        return raw === null ? fallback : JSON.parse(raw);
+      } catch {
+        return fallback;
+      }
+    },
+    setJSON(key, value) {
+      localStorage.setItem(key, JSON.stringify(value));
+    },
+  };
+
+  // Memoises getElementById results and re-fetches automatically if the cached
+  // element has been removed from the document (e.g. after a page navigation).
+  const DOMCache = {
+    _c: {},
+    get(id) {
+      const el = this._c[id];
+      if (el && document.contains(el)) return el;
+      return (this._c[id] = document.getElementById(id));
+    },
+    clear() { this._c = {}; },
+  };
+
+  // Returns a debounced wrapper that delays fn until ms ms after the last call.
+  // Replaces manual clearTimeout/setTimeout + timer variable patterns.
+  function debounce(fn, ms) {
+    let t = null;
+    return function (...args) {
+      clearTimeout(t);
+      t = setTimeout(() => fn(...args), ms);
+    };
+  }
+
+  // Schedules fn to run during browser idle time (with a 200 ms forced timeout).
+  // Falls back to setTimeout(50) in browsers without requestIdleCallback.
+  // Returns a handle that can be passed to cancelIdle().
+  function scheduleIdle(fn) {
+    return typeof requestIdleCallback === "function"
+      ? requestIdleCallback(fn, { timeout: 200 })
+      : setTimeout(fn, 50);
+  }
+  function cancelIdle(handle) {
+    if (typeof cancelIdleCallback === "function") cancelIdleCallback(handle);
+    else clearTimeout(handle);
+  }
+
+  // Resolves when the card grid has more children than countBefore, or after timeoutMs.
+  // Uses MutationObserver instead of setInterval polling — zero CPU cost between DOM events.
+  function waitForNewCards(grid, countBefore, timeoutMs) {
+    return new Promise((resolve) => {
+      if (!grid) {
+        // Grid not found (tab switched away?) — fall back to a plain sleep.
+        setTimeout(resolve, Math.min(timeoutMs, 500));
+        return;
+      }
+      let timer = null;
+      const obs = new MutationObserver(() => {
+        if (getCardWrappers().length > countBefore) {
+          obs.disconnect();
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+      obs.observe(grid, { childList: true });
+      timer = setTimeout(() => {
+        obs.disconnect();
+        resolve();
+      }, timeoutMs);
+    });
+  }
+
+  // Yields to the browser for at least minDelayMs.
+  // Races requestIdleCallback against a minimum sleep so React always gets
+  // at least minDelayMs to reconcile before the next "Load more" click,
+  // but the browser can process input / paint while we wait.
+  function waitForIdle(minDelayMs) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (!done) { done = true; resolve(); }
+      };
+      // Minimum floor — ensures React has time to reconcile even if idle fires early.
+      const minTimer = setTimeout(finish, minDelayMs);
+      if (typeof requestIdleCallback === "function") {
+        requestIdleCallback(() => {
+          clearTimeout(minTimer);
+          finish();
+        }, { timeout: minDelayMs });
+      }
+      // If no rIC support, minTimer alone resolves after minDelayMs.
+    });
+  }
 
   // ═══════════════════════════════════════════════════════════════
   //  PERSISTED STATE
@@ -300,7 +424,7 @@
   }
 
   function setStatus(msg, color = "#6b7280") {
-    const el = document.getElementById("gcb-status");
+    const el = DOMCache.get("gcb-status");
     if (el) {
       el.textContent = msg;
       el.style.color = color;
@@ -413,6 +537,39 @@
     );
   }
 
+  // Card metadata cache — avoids repeating querySelectorAll for country/rarity/shiny on
+  // every filter pass. WeakMap keys are automatically GC'd when wrapper elements are removed.
+  let _cardMeta = new WeakMap();
+  function getCardMeta(wrapper) {
+    if (_cardMeta.has(wrapper)) return _cardMeta.get(wrapper);
+    const meta = {
+      country: getCountryCode(wrapper),
+      rarity: getRarity(wrapper),
+      shiny: isShiny(wrapper),
+    };
+    _cardMeta.set(wrapper, meta);
+    return meta;
+  }
+  function clearCardMetaCache() { _cardMeta = new WeakMap(); }
+
+  // Coalescing idle filter scheduler — ensures at most one pending applyFilters call
+  // is queued at a time. Subsequent calls before the idle callback fires are no-ops.
+  // Use cancelIdleFilter() + applyFilters() to flush synchronously when needed.
+  let _idleFilterHandle = null;
+  function scheduleIdleFilter() {
+    if (_idleFilterHandle !== null) return;
+    _idleFilterHandle = scheduleIdle(() => {
+      _idleFilterHandle = null;
+      applyFilters();
+    });
+  }
+  function cancelIdleFilter() {
+    if (_idleFilterHandle !== null) {
+      cancelIdle(_idleFilterHandle);
+      _idleFilterHandle = null;
+    }
+  }
+
   function getCountryCode(card) {
     const img = card.querySelector('img[src*="flag-icons/flags/4x3/"]');
     if (!img) return null;
@@ -442,15 +599,20 @@
       // CSS handles their display:none via [data-gcb-deleted="true"] { display:none !important }.
       if (w.dataset.gcbDeleted === "true") continue;
       total++;
-      const country = getCountryCode(w);
-      const rarity = getRarity(w);
-      const shiny = isShiny(w);
+      // getCardMeta caches country/rarity/shiny per wrapper — DOM queries run once per card
+      // across all filter applications, not once per card per filter apply.
+      const { country, rarity, shiny } = getCardMeta(w);
       const countryOk = !country || filterState.countries.has(country);
       const rarityOk =
         filterState.rarities.size === 0 ||
         (rarity && filterState.rarities.has(rarity));
       const shinyOk = !filterState.shinyOnly || shiny;
-      const isFav = w.dataset.gcbFav === "true" || !!w.querySelector('button[class*="78350f"]');
+      // data-gcb-fav is stamped by applyCollectionFavStates() on tab activation.
+      // Cards added in later batches may not have been stamped yet — lazy-stamp them now.
+      if (w.dataset.gcbFav === undefined) {
+        w.dataset.gcbFav = !!w.querySelector('button[title="Unfavorite"]') ? "true" : "false";
+      }
+      const isFav = w.dataset.gcbFav === "true";
       const favOk =
         filterState.favsMode === "only" ? isFav :
         filterState.favsMode === "hide" ? !isFav :
@@ -460,7 +622,7 @@
       if (show) visible++;
     }
     if (!loadingAllCards) {
-      const el = document.getElementById("gcb-filter-count");
+      const el = DOMCache.get("gcb-filter-count");
       if (el) el.textContent = `Showing ${visible} of ${total} cards`;
     }
   }
@@ -487,6 +649,7 @@
   let currentPackFp = null;
   let overlayGoneTimer = null; // debounce for overlay-close detection
   let historyWindowOpen = false; // tracks whether the history panel is visible
+  let mythicWindowOpen = false;  // tracks whether the mythic pulls panel is visible
 
   function packFingerprint(cards) {
     return cards
@@ -496,17 +659,13 @@
   }
 
   function loadHistory() {
-    try {
-      return JSON.parse(localStorage.getItem("gcb-history") || "[]");
-    } catch {
-      return [];
-    }
+    return StorageUtils.getJSON("gcb-history", []);
   }
 
   function saveHistory(history) {
     if (history.length > MAX_HISTORY_PACKS)
       history = history.slice(-MAX_HISTORY_PACKS);
-    localStorage.setItem("gcb-history", JSON.stringify(history));
+    StorageUtils.setJSON("gcb-history", history);
   }
 
   // Called from the MutationObserver (300 ms debounce).
@@ -547,6 +706,13 @@
     saveHistory(hist);
     await runAutoDelete(cards, packTs); // wait so deleted state is stamped before building tiles
     if (historyWindowOpen) prependPackToHistory({ timestamp: packTs, cards });
+    const mythics = cards.filter(c => c.rarity === "mythic");
+    if (mythics.length) {
+      showMythicNotification(mythics);
+      if (mythicWindowOpen) prependMythicCards(mythics);
+      const mythicBtn = DOMCache.get("gcb-hist-mythic-btn");
+      if (mythicBtn) mythicBtn.style.display = "inline-flex";
+    }
   }
 
   function scrapeOverlayCards() {
@@ -579,7 +745,11 @@
       );
       const avatar = `https://a.ppy.sh/${id}`;
 
-      if (name) cards.push({ id, name, rarity, country, avatar, shiny });
+      if (name) {
+        const card = { id, name, rarity, country, avatar, shiny };
+        cacheCardMeta(card);
+        cards.push(card);
+      }
     }
     return cards;
   }
@@ -624,60 +794,116 @@
   }
 
   // Per-card state (favourited) persisted across modal reopens — keyed by player ID.
+  // _cardStatesCache avoids repeated JSON.parse on every buildCardTile call.
+  let _cardStatesCache = null;
   function loadCardStates() {
-    try {
-      return JSON.parse(localStorage.getItem("gcb-card-states") || "{}");
-    } catch {
-      return {};
-    }
+    if (_cardStatesCache !== null) return _cardStatesCache;
+    _cardStatesCache = StorageUtils.getJSON("gcb-card-states");
+    return _cardStatesCache;
   }
   function saveCardState(id, patch) {
+    _cardStatesCache = null; // invalidate so loadCardStates re-reads from storage
     const all = loadCardStates();
     all[id] = Object.assign(all[id] || {}, patch);
-    localStorage.setItem("gcb-card-states", JSON.stringify(all));
+    StorageUtils.setJSON("gcb-card-states", all);
+    _cardStatesCache = all;
   }
 
   // Per-pack-card deleted state — keyed by `${packTimestamp}_${cardId}`.
   // This lets the same player appear un-deleted in a different pack.
   function loadDeletedInstances() {
-    try {
-      return JSON.parse(localStorage.getItem("gcb-deleted-instances") || "{}");
-    } catch {
-      return {};
-    }
+    return StorageUtils.getJSON("gcb-deleted-instances");
   }
   function saveDeletedInstance(packTs, cardId) {
     const all = loadDeletedInstances();
     all[`${packTs}_${cardId}`] = true;
-    localStorage.setItem("gcb-deleted-instances", JSON.stringify(all));
+    StorageUtils.setJSON("gcb-deleted-instances", all);
   }
 
   // Collection-level deleted IDs — keyed by player ID, checked on every Collection tab activation.
   // Handles the case where the tab was inactive (unmounted) at deletion time so DOM removal was a no-op.
   function loadCollectionDeleted() {
-    try {
-      return new Set(
-        JSON.parse(localStorage.getItem("gcb-collection-deleted") || "[]"),
-      );
-    } catch {
-      return new Set();
-    }
+    return new Set(StorageUtils.getJSON("gcb-collection-deleted", []));
   }
   function saveCollectionDeleted(ids) {
-    localStorage.setItem(
-      "gcb-collection-deleted",
-      JSON.stringify([...ids]),
-    );
+    StorageUtils.setJSON("gcb-collection-deleted", [...ids]);
   }
   function markCollectionDeleted(playerId) {
     const ids = loadCollectionDeleted();
     ids.add(playerId);
     saveCollectionDeleted(ids);
-    updateDeletedCssRules(ids);
+    removeCardFromCollectionDom(playerId);
   }
 
   // ─── Auto-delete config ────────────────────────────────────────────────────
   const AD_KEY = "gcb-auto-delete";
+  const BL_KEY = "gcb-blacklist";
+  const BL_CFG_KEY = "gcb-blacklist-cfg";
+
+  function loadBlacklist() {
+    return StorageUtils.getJSON(BL_KEY);
+  }
+  function saveBlacklist(bl) {
+    StorageUtils.setJSON(BL_KEY, bl);
+  }
+
+  function loadBlacklistConfig() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(BL_CFG_KEY) || "{}");
+      return {
+        enabled:  !!raw.enabled,
+        rarities: new Set(raw.rarities || ["legendary", "epic"]),
+      };
+    } catch {
+      return { enabled: false, rarities: new Set(["legendary", "epic"]) };
+    }
+  }
+  function saveBlacklistConfig(cfg) {
+    localStorage.setItem(BL_CFG_KEY, JSON.stringify({
+      enabled:  cfg.enabled,
+      rarities: [...cfg.rarities],
+    }));
+  }
+
+  // Add a card to the blacklist if blacklisting is enabled and the card's
+  // rarity is in the configured set. Safe to call on every delete.
+  function addToBlacklist(card) {
+    const cfg = loadBlacklistConfig();
+    if (!cfg.enabled) return;
+    if (!cfg.rarities.has(card.rarity)) return;
+    const bl = loadBlacklist();
+    bl[card.id] = { name: card.name, rarity: card.rarity, country: card.country };
+    saveBlacklist(bl);
+  }
+
+  // ─── Card metadata cache ───────────────────────────────────────────────────
+  // Persists { name, rarity, country } keyed by player ID so the fetch hook can
+  // look up card details when a native deletion is intercepted.
+  const CARD_META_KEY = "gcb-card-meta";
+  function loadCardMeta() {
+    return StorageUtils.getJSON(CARD_META_KEY);
+  }
+  function cacheCardMeta(card) {
+    if (!card.id || !card.name) return;
+    const meta = loadCardMeta();
+    meta[card.id] = { name: card.name, rarity: card.rarity, country: card.country };
+    StorageUtils.setJSON(CARD_META_KEY, meta);
+  }
+  function lookupCardMeta(playerId) {
+    return loadCardMeta()[playerId] || null;
+  }
+
+  function removeFromBlacklist(id) {
+    const bl = loadBlacklist();
+    delete bl[id];
+    saveBlacklist(bl);
+  }
+
+  // Returns true if this card ID is in the blacklist AND blacklisting is enabled.
+  function isBlacklisted(cardId) {
+    if (!loadBlacklistConfig().enabled) return false;
+    return !!loadBlacklist()[cardId];
+  }
 
   function loadAutoDeleteConfig() {
     try {
@@ -739,33 +965,54 @@
     console.log(`[GachaBot] runAutoDelete: enabled=${cfg.enabled}, rarities=[${[...cfg.rarities]}], natMode=${cfg.natMode}, nations=[${[...cfg.nations]}], cards=${cards.map(c => `${c.name}(${c.rarity},${c.country})`).join(", ")}`);
     if (!cfg.enabled) return;
     for (const card of cards) {
-      if (!shouldAutoDelete(card, cfg)) continue;
+      if (!shouldAutoDelete(card, cfg) && !isBlacklisted(card.id)) continue;
       const ok = await apiDelete(card.id);
       if (ok) {
         markCollectionDeleted(card.id);
         if (packTs) saveDeletedInstance(packTs, card.id);
+        addToBlacklist(card);
         console.log(`[GachaBot] Auto-deleted: ${card.name} (${card.rarity}, ${card.country})`);
       }
     }
   }
   // ──────────────────────────────────────────────────────────────────────────
 
-  // Injects/updates a <style> with :has() rules for every deleted player ID.
-  // CSS is applied by the browser before paint, so cards are never visible even
-  // for a single frame when React renders the collection tab from RSC cache.
-  function updateDeletedCssRules(ids) {
-    if (!ids) ids = loadCollectionDeleted();
-    let el = document.getElementById("gcb-deleted-rules");
-    if (!el) {
-      el = document.createElement("style");
-      el.id = "gcb-deleted-rules";
-      document.head.appendChild(el);
-    }
-    if (!ids.size) { el.textContent = ""; return; }
-    el.textContent = [...ids].map(id =>
-      `#tabs-content-collection .grid > .relative:has(a[href*="/users/${id}"]) { display: none !important; }`
-    ).join("\n");
+  // Intercept native DELETE /api/collection requests so that cards deleted
+  // through the site's own UI are still marked and blacklisted by our script.
+  function installFetchHook() {
+    const origFetch = window.fetch;
+    window.fetch = async function (...args) {
+      const res = await origFetch.apply(this, args);
+      try {
+        const [input, init] = args;
+        const url = typeof input === "string" ? input : input?.url || "";
+        const method = (init?.method || (input?.method) || "GET").toUpperCase();
+        if (method === "DELETE" && url.includes("/api/collection") && res.ok) {
+          const body = init?.body || input?.body;
+          if (body) {
+            const parsed = JSON.parse(typeof body === "string" ? body : await new Response(body).text());
+            for (const id of parsed.playerIds || []) {
+              markCollectionDeleted(id);
+              const meta = lookupCardMeta(id);
+              if (meta) addToBlacklist({ id, ...meta });
+            }
+          }
+        }
+      } catch {
+        // never break the original request
+      }
+      return res;
+    };
   }
+  installFetchHook();
+
+  // updateDeletedCssRules() was removed in v1.34.
+  // It injected per-ID CSS :has() rules that caused Firefox to spend ~70% of CPU in
+  // style::invalidation::element::relative_selector::* on every DOM mutation, producing
+  // five ~10-second LongTasks during loadAllCards(). Flash prevention is now handled
+  // by hiding the collection grid while applyCollectionDeletions() runs synchronously,
+  // and by startDeletionObserver() which pre-stamps data-gcb-deleted before paint.
+  function updateDeletedCssRules() { /* removed in v1.34 — see changelog */ }
 
   // Called every time the Collection tab activates — stamps data-gcb-deleted on
   // cards whose player IDs were recorded as deleted via the history panel.
@@ -775,16 +1022,47 @@
   function applyCollectionDeletions() {
     const deleted = loadCollectionDeleted();
     if (!deleted.size) return;
-    for (const w of document.querySelectorAll(
-      "#tabs-content-collection .grid > .relative",
-    )) {
+    for (const w of getCardWrappers()) {
       const a = w.querySelector("a[href]");
       if (!a) continue;
       const m = a.href.match(/\/users\/(\d+)/);
-      if (m && deleted.has(parseInt(m[1]))) {
-        w.dataset.gcbDeleted = "true";
-      }
+      if (!m) continue;
+      const id = parseInt(m[1]);
+      if (!deleted.has(id)) continue;
+      // Re-stamp the attribute — React re-renders lose it on each DOM refresh.
+      w.dataset.gcbDeleted = "true";
     }
+  }
+
+  // Watches the collection grid and pre-stamps data-gcb-deleted on any card React
+  // adds while the tab is active. MutationObserver callbacks fire after DOM mutations
+  // but before the browser's next paint, so deleted cards are never visible.
+  let _deletionObserver = null;
+  function startDeletionObserver() {
+    if (_deletionObserver) return;
+    const grid = document.querySelector("#tabs-content-collection .grid");
+    if (!grid) return;
+    _deletionObserver = new MutationObserver((mutations) => {
+      const deleted = loadCollectionDeleted();
+      if (!deleted.size) return;
+      for (const mutation of mutations) {
+        for (const node of mutation.addedNodes) {
+          if (node.nodeType !== 1) continue;
+          const a = node.querySelector("a[href]");
+          if (!a) continue;
+          const m = a.href.match(/\/users\/(\d+)/);
+          if (m && deleted.has(parseInt(m[1]))) {
+            node.dataset.gcbDeleted = "true";
+          }
+        }
+      }
+    });
+    _deletionObserver.observe(grid, { childList: true });
+  }
+  function stopDeletionObserver() {
+    if (!_deletionObserver) return;
+    _deletionObserver.disconnect();
+    _deletionObserver = null;
   }
 
   // Called every time the Collection tab activates — stamps data-gcb-fav on each
@@ -793,16 +1071,27 @@
   // attribute, which React ignores.
   function applyCollectionFavStates() {
     const states = loadCardStates();
-    for (const w of document.querySelectorAll(
-      "#tabs-content-collection .grid > .relative",
-    )) {
+    for (const w of getCardWrappers()) {
       const a = w.querySelector("a[href]");
       if (!a) continue;
       const m = a.href.match(/\/users\/(\d+)/);
       if (!m) continue;
-      const stored = states[parseInt(m[1])];
-      if (stored?.fav === true) w.dataset.gcbFav = "true";
-      else if (stored?.fav === false) w.dataset.gcbFav = "false";
+      const id = parseInt(m[1]);
+      const stored = states[id];
+      // Native button title is "Unfavorite" when the card is actually favourited.
+      const nativeFav = !!w.querySelector('button[title="Unfavorite"]');
+      // If our stored state disagrees with the site, trust the site and heal the record.
+      if (stored?.fav === false && nativeFav) {
+        saveCardState(id, { fav: true });
+        w.dataset.gcbFav = "true";
+      } else if (stored?.fav === true) {
+        w.dataset.gcbFav = "true";
+      } else if (stored?.fav === false) {
+        w.dataset.gcbFav = "false";
+      } else {
+        // No stored record — derive from native button and stamp so filters can rely on the attribute.
+        w.dataset.gcbFav = nativeFav ? "true" : "false";
+      }
     }
   }
 
@@ -810,10 +1099,7 @@
   // Stamps data-gcb-deleted instead of calling remove() — see applyCollectionDeletions
   // for why removing from React's managed DOM causes crashes.
   function removeCardFromCollectionDom(playerId) {
-    const wrappers = document.querySelectorAll(
-      "#tabs-content-collection .grid > .relative",
-    );
-    for (const w of wrappers) {
+    for (const w of getCardWrappers()) {
       if (w.querySelector(`a[href*="/users/${playerId}"]`)) {
         w.dataset.gcbDeleted = "true";
       }
@@ -822,9 +1108,7 @@
 
   // Return the collection grid wrapper for a given player ID, or null if not loaded.
   function findCollectionCard(playerId) {
-    for (const w of document.querySelectorAll(
-      "#tabs-content-collection .grid > .relative",
-    )) {
+    for (const w of getCardWrappers()) {
       if (w.querySelector(`a[href*="/users/${playerId}"]`)) return w;
     }
     return null;
@@ -869,6 +1153,7 @@
   }
 
   function buildCardTile(card, packTs) {
+    cacheCardMeta(card);
     const rarityColor = RARITY_COLORS[card.rarity] || "#9ca3af";
     // fav is shared per player ID; deleted is per pack-card instance so the same
     // player in a different pack is not affected.
@@ -890,6 +1175,7 @@
     const img = document.createElement("img");
     img.src = card.avatar;
     img.alt = card.name;
+    img.loading = "lazy";
     img.style.cssText =
       "width:100%;aspect-ratio:1;object-fit:cover;display:block;";
     img.onerror = () => {
@@ -901,6 +1187,7 @@
     info.style.cssText = "padding:6px 6px 7px;text-align:center;";
     const flagHtml = card.country
       ? `<img src="https://cdn.jsdelivr.net/gh/lipis/flag-icons/flags/4x3/${card.country}.svg"
+              loading="lazy"
               style="height:10px;vertical-align:middle;margin-right:3px;border-radius:1px;"
               onerror="this.style.display='none'">`
       : "";
@@ -1026,6 +1313,7 @@
         state.deleted = true;
         if (packTs) saveDeletedInstance(packTs, card.id);
         markCollectionDeleted(card.id);
+        addToBlacklist(card);
         overlay.style.display = "none";
         deletedLabel.style.display = "flex";
         removeCardFromCollectionDom(card.id);
@@ -1062,32 +1350,235 @@
     return section;
   }
 
+  // Generation counter — incremented on each renderHistory() call so that
+  // deferred batches from a previous render don't append to a re-cleared body.
+  let _histRenderGen = 0;
+
+  function _renderHistoryBatch(body, history, startIdx, gen) {
+    if (gen !== _histRenderGen) return; // stale batch — body was cleared since
+    const BATCH_SIZE = 8;
+    const end = Math.max(-1, startIdx - BATCH_SIZE);
+    for (let i = startIdx; i > end; i--) {
+      body.appendChild(buildPackSection(history[i]));
+    }
+    if (end >= 0) {
+      setTimeout(() => _renderHistoryBatch(body, history, end, gen), 0);
+    }
+  }
+
   function renderHistory() {
-    const body = document.getElementById("gcb-hist-body");
-    if (!body) return;
+    const body = DOMCache.get("gcb-hist-body");
+    if (!body) return [];
     const history = loadHistory();
+    const gen = ++_histRenderGen;
 
     if (!history.length) {
       body.innerHTML =
         '<p style="color:#4b5563;text-align:center;padding:48px 0;font-size:13px;">No history yet. Open some packs with Auto Open!</p>';
-      return;
+      return history;
     }
 
     body.innerHTML = "";
-    for (let i = history.length - 1; i >= 0; i--) {
+    const last = history.length - 1;
+    // Render the 5 newest packs synchronously so the modal appears immediately
+    // with visible content, then defer the rest in batches.
+    const INITIAL = 5;
+    const syncEnd = Math.max(-1, last - INITIAL);
+    for (let i = last; i > syncEnd; i--) {
       body.appendChild(buildPackSection(history[i]));
     }
+    if (syncEnd >= 0) {
+      setTimeout(() => _renderHistoryBatch(body, history, syncEnd, gen), 0);
+    }
+    return history;
   }
 
   // Prepend a single newly-scraped pack to the history body without
   // re-rendering the whole list. Preserves the user's scroll position.
   function prependPackToHistory(pack) {
-    const body = document.getElementById("gcb-hist-body");
+    const body = DOMCache.get("gcb-hist-body");
     if (!body) return;
     // Remove "No history yet" placeholder if present
     const placeholder = body.querySelector("p");
     if (placeholder) body.innerHTML = "";
     body.insertBefore(buildPackSection(pack), body.firstChild);
+  }
+
+  function showMythicNotification(mythicCards) {
+    const existing = DOMCache.get("gcb-mythic-toast");
+    if (existing) existing.remove();
+
+    const toast = document.createElement("div");
+    toast.id = "gcb-mythic-toast";
+    toast.style.cssText = `
+      position:fixed; top:60px; left:50%; transform:translateX(-50%);
+      z-index:99999; background:linear-gradient(135deg,#1a0505 0%,#2d0a0a 100%);
+      border:2px solid rgba(239,68,68,0.8); border-radius:16px;
+      padding:18px 28px; min-width:260px; max-width:480px;
+      text-align:center; cursor:pointer;
+    `;
+    toast.innerHTML = `
+      <div id="gcb-mythic-toast-title" style="font-size:20px;font-weight:900;letter-spacing:4px;
+           text-transform:uppercase;color:#ef4444;margin-bottom:8px;">
+        ⚠ MYTHIC PULL ⚠
+      </div>
+      <div id="gcb-mythic-toast-names" style="font-size:13px;color:#9ca3af;line-height:1.6;"></div>
+      <div style="margin-top:10px;font-size:10px;color:#4b5563;letter-spacing:1px;">Click to dismiss</div>
+    `;
+    const namesEl = toast.querySelector("#gcb-mythic-toast-names");
+    mythicCards.forEach((c, i) => {
+      if (i > 0) namesEl.appendChild(document.createTextNode(", "));
+      const span = document.createElement("span");
+      span.style.cssText = "color:#f9fafb;font-weight:700;";
+      span.textContent = c.name;
+      namesEl.appendChild(span);
+    });
+
+    function dismiss() {
+      toast.classList.add("gcb-closing");
+      toast.addEventListener("animationend", () => toast.remove(), { once: true });
+    }
+    toast.addEventListener("click", dismiss);
+    const timer = setTimeout(dismiss, 6000);
+    toast.addEventListener("click", () => clearTimeout(timer), { once: true });
+
+    document.body.appendChild(toast);
+  }
+
+  function buildMythicModal() {
+    const modal = document.createElement("div");
+    modal.id = "gcb-mythic-modal";
+    modal.style.cssText = `
+      display:none; position:fixed; right:302px; top:160px; z-index:20000;
+      width:780px; max-height:80vh;
+      background:#0a0f1a; border:1px solid rgba(239,68,68,0.35); border-radius:16px;
+      overflow:hidden; flex-direction:column;
+      box-shadow:0 8px 32px rgba(239,68,68,0.15), 0 4px 16px rgba(0,0,0,0.7);
+    `;
+    modal.innerHTML = `
+      <div id="gcb-mythic-header" style="display:flex;align-items:center;justify-content:space-between;
+           padding:14px 20px;background:#0d1525;border-bottom:1px solid rgba(239,68,68,0.2);
+           cursor:grab;user-select:none;flex-shrink:0;">
+        <span style="font-weight:800;font-size:12px;letter-spacing:3px;
+             color:#ef4444;text-transform:uppercase;">Mythic Pulls</span>
+        <button id="gcb-mythic-close" style="background:none;border:none;
+            color:#4b5563;cursor:pointer;font-size:15px;line-height:1;padding:0;">✕</button>
+      </div>
+      <div id="gcb-mythic-body" style="padding:18px 20px;overflow-y:auto;flex:1;"></div>
+    `;
+    document.body.appendChild(modal);
+
+    modal.querySelector("#gcb-mythic-close").addEventListener("click", () => {
+      modal.style.display = "none";
+      mythicWindowOpen = false;
+    });
+    document.addEventListener("mousedown", (e) => {
+      if (mythicWindowOpen && !modal.contains(e.target)) {
+        const mainPanel = DOMCache.get("gcb-panel");
+        if (!mainPanel?.contains(e.target)) {
+          modal.style.display = "none";
+          mythicWindowOpen = false;
+        }
+      }
+    });
+    makeDraggable(modal, modal.querySelector("#gcb-mythic-header"));
+    return modal;
+  }
+
+  function renderMythicWindow() {
+    const body = DOMCache.get("gcb-mythic-body");
+    if (!body) return;
+    const history = loadHistory();
+    const mythics = history.flatMap(pack =>
+      pack.cards.filter(c => c.rarity === "mythic").map(c => ({ ...c, packTs: pack.timestamp }))
+    ).reverse();
+    if (!mythics.length) {
+      body.innerHTML = '<p style="color:#4b5563;text-align:center;padding:48px 0;font-size:13px;">No mythic cards pulled yet.</p>';
+      return;
+    }
+    body.innerHTML = "";
+    const grid = document.createElement("div");
+    grid.style.cssText = "display:flex;flex-wrap:wrap;gap:8px;";
+    for (const card of mythics) grid.appendChild(buildCardTile(card, card.packTs));
+    body.appendChild(grid);
+  }
+
+  function prependMythicCards(cards) {
+    const body = DOMCache.get("gcb-mythic-body");
+    if (!body) return;
+    const placeholder = body.querySelector("p");
+    if (placeholder) placeholder.remove();
+    let grid = body.querySelector(".gcb-mythic-grid");
+    if (!grid) {
+      grid = document.createElement("div");
+      grid.className = "gcb-mythic-grid";
+      grid.style.cssText = "display:flex;flex-wrap:wrap;gap:8px;";
+      body.prepend(grid);
+    }
+    for (const card of cards) grid.prepend(buildCardTile(card, Date.now()));
+  }
+
+  function buildBlacklistModal() {
+    const modal = document.createElement("div");
+    modal.id = "gcb-bl-modal";
+    modal.style.cssText = `
+      display:none; position:fixed; right:302px; top:260px; z-index:20001;
+      width:320px; max-height:70vh;
+      background:#0a0f1a; border:1px solid #1f2937; border-radius:14px;
+      overflow:hidden; flex-direction:column;
+      box-shadow:0 8px 32px rgba(0,0,0,0.7);
+    `;
+    modal.innerHTML = `
+      <div id="gcb-bl-modal-header" style="display:flex;align-items:center;justify-content:space-between;
+           padding:12px 16px;background:#0d1525;border-bottom:1px solid #1f2937;
+           cursor:grab;user-select:none;flex-shrink:0;">
+        <span style="font-weight:800;font-size:11px;letter-spacing:2.5px;color:#9ca3af;text-transform:uppercase;">Blacklist</span>
+        <button id="gcb-bl-modal-close" style="background:none;border:none;
+            color:#4b5563;cursor:pointer;font-size:15px;line-height:1;padding:0;">✕</button>
+      </div>
+      <div id="gcb-bl-modal-body" style="padding:10px 14px;overflow-y:auto;flex:1;"></div>
+    `;
+    document.body.appendChild(modal);
+
+    modal.querySelector("#gcb-bl-modal-close").addEventListener("click", () => {
+      modal.style.display = "none";
+    });
+    makeDraggable(modal, modal.querySelector("#gcb-bl-modal-header"));
+    return modal;
+  }
+
+  function renderBlacklistModal(onChangeCallback) {
+    const body = DOMCache.get("gcb-bl-modal-body");
+    if (!body) return;
+    const bl = loadBlacklist();
+    const entries = Object.entries(bl);
+    if (!entries.length) {
+      body.innerHTML = '<p style="color:#4b5563;text-align:center;padding:24px 0;font-size:12px;">Blacklist is empty.</p>';
+      return;
+    }
+    body.innerHTML = "";
+    for (const [id, data] of entries) {
+      const color = RARITY_COLORS[data.rarity] || "#9ca3af";
+      const row = document.createElement("div");
+      row.style.cssText = "display:flex;align-items:center;justify-content:space-between;padding:5px 4px;border-bottom:1px solid #111827;";
+      row.innerHTML = `
+        <div style="display:flex;align-items:center;gap:6px;overflow:hidden;">
+          <span style="width:7px;height:7px;border-radius:50%;background:${color};flex-shrink:0;display:inline-block;"></span>
+          <span style="font-size:12px;color:#d1d5db;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${data.name}">${data.name}</span>
+        </div>
+        <button data-id="${id}" style="font-size:10px;color:#ef4444;background:none;border:1px solid #ef444430;
+            border-radius:5px;padding:1px 7px;cursor:pointer;flex-shrink:0;margin-left:8px;">✕</button>
+      `;
+      row.querySelector("button").addEventListener("click", () => {
+        removeFromBlacklist(id);
+        row.remove();
+        if (!body.children.length) {
+          body.innerHTML = '<p style="color:#4b5563;text-align:center;padding:24px 0;font-size:12px;">Blacklist is empty.</p>';
+        }
+        if (onChangeCallback) onChangeCallback();
+      });
+      body.appendChild(row);
+    }
   }
 
   function buildHistoryModal() {
@@ -1107,6 +1598,7 @@
                  cursor:grab;user-select:none;flex-shrink:0;">
                 <span style="font-weight:800;font-size:12px;letter-spacing:3px;
                      color:#3b82f6;text-transform:uppercase;">Pack History</span>
+                <button id="gcb-hist-mythic-btn" class="gcb-mythic-badge" style="display:none;">✦ Mythic Pulls</button>
                 <div style="display:flex;gap:10px;align-items:center;">
                     <button id="gcb-hist-clear" style="font-size:11px;color:#ef4444;background:none;
                         border:1px solid #ef444440;border-radius:6px;padding:3px 10px;cursor:pointer;">
@@ -1131,8 +1623,20 @@
         renderHistory();
       }
     });
+    modal.querySelector("#gcb-hist-mythic-btn").addEventListener("click", () => {
+      const mythicModal = DOMCache.get("gcb-mythic-modal");
+      if (mythicModal) { mythicModal.style.display = "flex"; mythicWindowOpen = true; renderMythicWindow(); }
+    });
 
     makeDraggable(modal, modal.querySelector("#gcb-hist-header"));
+
+    // Close when clicking outside the modal
+    document.addEventListener("mousedown", (e) => {
+      if (historyWindowOpen && !modal.contains(e.target)) {
+        modal.style.display = "none";
+        historyWindowOpen = false;
+      }
+    });
 
     return modal;
   }
@@ -1182,6 +1686,45 @@
             #tabs-content-collection .grid > .relative[data-gcb-deleted="true"] {
                 display: none !important;
             }
+
+            @keyframes gcb-mythic-in {
+                from { opacity:0; transform:scale(0.85) translateY(-20px); }
+                to   { opacity:1; transform:scale(1) translateY(0); }
+            }
+            @keyframes gcb-mythic-out {
+                from { opacity:1; transform:scale(1); }
+                to   { opacity:0; transform:scale(0.9) translateY(-10px); }
+            }
+            @keyframes gcb-mythic-glow {
+                0%,100% { box-shadow: 0 0 30px 8px rgba(239,68,68,0.55), 0 0 80px 20px rgba(239,68,68,0.2); }
+                50%      { box-shadow: 0 0 50px 16px rgba(239,68,68,0.8), 0 0 120px 40px rgba(239,68,68,0.35); }
+            }
+            @keyframes gcb-mythic-text {
+                0%,100% { text-shadow: 0 0 12px #ef4444, 0 0 30px #ef4444; }
+                50%      { text-shadow: 0 0 24px #fff, 0 0 60px #ef4444; }
+            }
+            #gcb-mythic-toast {
+                animation: gcb-mythic-in 0.35s cubic-bezier(0.23,1,0.32,1) forwards,
+                           gcb-mythic-glow 1.4s ease-in-out infinite;
+            }
+            #gcb-mythic-toast.gcb-closing {
+                animation: gcb-mythic-out 0.3s ease-in forwards !important;
+            }
+            #gcb-mythic-toast-title {
+                animation: gcb-mythic-text 1.4s ease-in-out infinite;
+            }
+            @keyframes gcb-mythic-badge-pulse {
+                0%,100% { box-shadow: 0 0 6px 1px rgba(239,68,68,0.7); opacity:1; }
+                50%      { box-shadow: 0 0 14px 4px rgba(239,68,68,1); opacity:0.8; }
+            }
+            .gcb-mythic-badge {
+                display:inline-flex; align-items:center; gap:4px;
+                padding:2px 7px; border-radius:10px; font-size:10px; font-weight:800;
+                letter-spacing:1.5px; text-transform:uppercase; cursor:pointer;
+                background:#7f1d1d; color:#fca5a5; border:1px solid #ef4444;
+                animation: gcb-mythic-badge-pulse 1.2s ease-in-out infinite;
+            }
+            .gcb-mythic-badge:hover { background:#991b1b; }
 
             /* Correct fav button appearance when collection tab remounts from RSC cache.
                React controls button classes; we set data-gcb-fav on the wrapper, which
@@ -1330,6 +1873,25 @@
                         <p class="gcb-label">Whitelist (never delete)</p>
                         <textarea id="gcb-ad-whitelist" rows="3" placeholder="Player names, one per line" style="width:100%;background:#111827;border:1px solid #374151;border-radius:6px;color:#d1d5db;font-size:11px;padding:6px;resize:vertical;font-family:monospace;margin-bottom:4px;line-height:1.5;"></textarea>
                         <p style="font-size:10px;color:#4b5563;margin:0;">Whitelisted names are never auto-deleted.</p>
+                        <!-- Blacklist -->
+                        <div style="border-top:1px solid #1f2937;margin-top:12px;padding-top:10px;">
+                            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+                                <p class="gcb-label" style="margin:0;">Remember Deleted</p>
+                                <label class="gcb-toggle" style="margin:0;" id="gcb-bl-toggle-label">
+                                    <input type="checkbox" id="gcb-bl-enabled">
+                                    <span class="gcb-slider"></span>
+                                </label>
+                            </div>
+                            <p style="font-size:10px;color:#4b5563;margin:0 0 6px;">Repulled cards matching these rarities are auto-deleted:</p>
+                            <div id="gcb-bl-rarities" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px;"></div>
+                            <div style="display:flex;align-items:center;justify-content:space-between;">
+                                <span id="gcb-bl-count" style="font-size:10px;color:#4b5563;">0 remembered</span>
+                                <div style="display:flex;gap:5px;">
+                                    <button id="gcb-bl-view" style="font-size:10px;color:#60a5fa;background:none;border:1px solid #60a5fa40;border-radius:6px;padding:2px 8px;cursor:pointer;">View</button>
+                                    <button id="gcb-bl-clear" style="font-size:10px;color:#ef4444;background:none;border:1px solid #ef444440;border-radius:6px;padding:2px 8px;cursor:pointer;">Clear</button>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
@@ -1341,16 +1903,22 @@
     // ── Close ──
     panel.querySelector("#gcb-close").addEventListener("click", () => {
       panel.style.display = "none";
-      document.getElementById("gcb-fab").style.display = "flex";
+      DOMCache.get("gcb-fab").style.display = "flex";
     });
+
 
     // ── History ──
     panel.querySelector("#gcb-hist-open").addEventListener("click", () => {
-      const modal = document.getElementById("gcb-history-modal");
+      const modal = DOMCache.get("gcb-history-modal");
       if (!modal) return;
-      renderHistory();
+      // Show the modal before rendering so it appears immediately; renderHistory
+      // renders the first few packs synchronously then defers the rest.
       modal.style.display = "flex";
       historyWindowOpen = true;
+      const history = renderHistory();
+      const hasMythics = history.some(p => p.cards.some(c => c.rarity === "mythic"));
+      const mythicBtn = modal.querySelector("#gcb-hist-mythic-btn");
+      if (mythicBtn) mythicBtn.style.display = hasMythics ? "inline-flex" : "none";
     });
 
     // ── Auto-open toggle ──
@@ -1544,6 +2112,68 @@
         );
         saveAutoDeleteConfig(cfg);
       });
+
+      // ── Blacklist sub-section ──
+      const blCfg = loadBlacklistConfig();
+
+      const blEnabled = panel.querySelector("#gcb-bl-enabled");
+      blEnabled.checked = blCfg.enabled;
+      panel.querySelector("#gcb-bl-toggle-label").addEventListener("click", (e) => {
+        e.stopPropagation();
+      });
+      blEnabled.addEventListener("change", () => {
+        blCfg.enabled = blEnabled.checked;
+        saveBlacklistConfig(blCfg);
+      });
+
+      const blCountEl = panel.querySelector("#gcb-bl-count");
+      function refreshBlCount() {
+        const n = Object.keys(loadBlacklist()).length;
+        blCountEl.textContent = `${n} remembered`;
+      }
+      refreshBlCount();
+
+      const blRaritiesEl = panel.querySelector("#gcb-bl-rarities");
+      for (const r of RARITIES) {
+        const btn = document.createElement("button");
+        btn.className = "gcb-rarity-btn";
+        btn.textContent = r[0].toUpperCase() + r.slice(1);
+        btn.style.border = `1px solid ${RARITY_COLORS[r]}40`;
+        btn.style.color  = RARITY_COLORS[r];
+        if (blCfg.rarities.has(r)) {
+          btn.style.background = RARITY_COLORS[r] + "22";
+          btn.style.fontWeight = "700";
+        }
+        btn.addEventListener("click", () => {
+          if (blCfg.rarities.has(r)) {
+            blCfg.rarities.delete(r);
+            btn.style.background = "transparent";
+            btn.style.fontWeight = "400";
+          } else {
+            blCfg.rarities.add(r);
+            btn.style.background = RARITY_COLORS[r] + "22";
+            btn.style.fontWeight = "700";
+          }
+          saveBlacklistConfig(blCfg);
+        });
+        blRaritiesEl.appendChild(btn);
+      }
+
+      panel.querySelector("#gcb-bl-view").addEventListener("click", () => {
+        const blModal = DOMCache.get("gcb-bl-modal");
+        if (!blModal) return;
+        renderBlacklistModal(refreshBlCount);
+        blModal.style.display = "flex";
+      });
+
+      panel.querySelector("#gcb-bl-clear").addEventListener("click", () => {
+        if (confirm("Clear the blacklist? Repulled cards will no longer be auto-deleted.")) {
+          saveBlacklist({});
+          refreshBlCount();
+          const blModal = DOMCache.get("gcb-bl-modal");
+          if (blModal && blModal.style.display !== "none") renderBlacklistModal(refreshBlCount);
+        }
+      });
     })();
 
     // ── Drag ──
@@ -1564,7 +2194,7 @@
   let loadingAllCards = false;
 
   function setFilterStatus(msg, color = "#4b5563") {
-    const el = document.getElementById("gcb-filter-count");
+    const el = DOMCache.get("gcb-filter-count");
     if (el) {
       el.textContent = msg;
       el.style.color = color;
@@ -1574,6 +2204,9 @@
   async function loadAllCards() {
     if (loadingAllCards) return;
     loadingAllCards = true;
+    // Clear per-card caches so a fresh load doesn't serve stale DOM-extracted metadata.
+    clearCardMetaCache();
+    _lastCountryCardCount = 0;
     setFilterStatus("Waiting for cards...", "#60a5fa");
     try {
       // Wait up to 8s for the first "Load more" button to appear (cards may still be rendering)
@@ -1586,7 +2219,7 @@
 
       // Inject opacity override early so each batch of cards becomes visible as it loads,
       // not all at once at the end. !important beats React's inline style="opacity:0".
-      if (!document.getElementById("gcb-card-visible")) {
+      if (!DOMCache.get("gcb-card-visible")) {
         const s = document.createElement("style");
         s.id = "gcb-card-visible";
         s.textContent =
@@ -1600,6 +2233,8 @@
         );
       }
 
+      const grid = document.querySelector("#tabs-content-collection .grid");
+
       while (loadMore) {
         const before = getCardWrappers().length;
         const remaining = loadMore.innerText.match(/\d+/);
@@ -1607,26 +2242,26 @@
         setFilterStatus(`Loading… ${before} / ${total}`, "#60a5fa");
         loadMore.click();
 
-        // Wait up to 5s for new cards to appear
-        await new Promise((resolve) => {
-          const deadline = Date.now() + 5000;
-          const id = setInterval(() => {
-            if (getCardWrappers().length > before || Date.now() > deadline) {
-              clearInterval(id);
-              resolve();
-            }
-          }, 200);
-        });
+        // Wait for new cards using MutationObserver — zero CPU between DOM events.
+        await waitForNewCards(grid, before, 5000);
 
         if (getCardWrappers().length === before) break;
-        await sleep(200);
-        refreshCountryList();
-        applyFilters();
+        // Yield to the browser so React can finish reconciling and the user can interact.
+        await waitForIdle(150);
+        // Deletions must be stamped synchronously — CSS and applyFilters both depend on the attribute.
+        applyCollectionDeletions();
+        // Country scan is fast (new wrappers only) — keep it synchronous so _lastCountryCardCount stays consistent.
+        refreshCountryList(true);
+        // Style mutations (display:none) are deferred to idle time — coalesced so only one pending call at a time.
+        scheduleIdleFilter();
         loadMore = findLoadMoreButton();
       }
     } finally {
       loadingAllCards = false;
+      // Cancel any pending idle filter and run a final synchronous pass for accurate end state.
+      cancelIdleFilter();
       refreshCountryList();
+      applyCollectionDeletions();
       applyFilters();
     }
   }
@@ -1691,7 +2326,7 @@
       () => (btn.style.borderColor = "#3b82f640"),
     );
     btn.addEventListener("click", () => {
-      const panel = document.getElementById("gcb-panel");
+      const panel = DOMCache.get("gcb-panel");
       panel.style.display = "block";
       btn.style.display = "none";
     });
@@ -1701,7 +2336,7 @@
 
   function updatePackDisplay() {
     const count = readPackCount();
-    const el = document.getElementById("gcb-packs");
+    const el = DOMCache.get("gcb-packs");
     if (!el) return;
     if (count >= 0) {
       el.textContent = `🃏 ${count}/10`;
@@ -1709,10 +2344,33 @@
     }
   }
 
-  function refreshCountryList() {
-    const container = document.getElementById("gcb-countries");
+  // Tracks how many wrappers have already been scanned for country codes.
+  // Incremental mode skips already-scanned cards — O(newCards) instead of O(allCards) per batch.
+  let _lastCountryCardCount = 0;
+
+  // incrementalOnly=true: only scan cards added since last call (used during batch loading).
+  // incrementalOnly=false (default): full scan, used on tab activation and load completion.
+  function refreshCountryList(incrementalOnly = false) {
+    const container = DOMCache.get("gcb-countries");
     if (!container) return;
-    const countryMap = collectCountries();
+
+    let countryMap;
+    if (incrementalOnly) {
+      const wrappers = [...getCardWrappers()];
+      const newWrappers = wrappers.slice(_lastCountryCardCount);
+      _lastCountryCardCount = wrappers.length;
+      if (!newWrappers.length) return;
+      countryMap = new Map();
+      for (const w of newWrappers) {
+        const img = w.querySelector('img[src*="flag-icons/flags/4x3/"]');
+        if (!img) continue;
+        const m = img.src.match(/flags\/4x3\/([a-z]+)\.svg/);
+        if (m) countryMap.set(m[1], img.src);
+      }
+    } else {
+      _lastCountryCardCount = getCardWrappers().length;
+      countryMap = collectCountries();
+    }
 
     for (const [code, src] of countryMap) {
       if (container.querySelector(`[data-code="${code}"]`)) continue;
@@ -1762,20 +2420,30 @@
   // ═══════════════════════════════════════════════════════════════
 
   injectStyles();
-  updateDeletedCssRules(); // restore :has() hide rules from localStorage immediately
   const panel = buildPanel();
   buildFab();
   buildHistoryModal();
+  buildMythicModal();
+  buildBlacklistModal();
 
   let collectionTabWasSeen = false;
 
   // Update collection filter section visibility when tabs change
   function syncFilterSection() {
-    const section = document.getElementById("gcb-filter-section");
+    const section = DOMCache.get("gcb-filter-section");
     if (!section) return;
     if (isCollectionTabActive()) {
       section.style.display = "block";
+      // Start the observer before stamping so it catches any cards React adds
+      // in subsequent mutations while the tab stays open.
+      startDeletionObserver();
+      // Briefly hide the grid while we stamp data-gcb-deleted. Both the hide and
+      // the attribute stamps are synchronous — the browser batches them into one
+      // paint, so deleted cards are never visible even for a single frame.
+      const grid = document.querySelector("#tabs-content-collection .grid");
+      if (grid) grid.style.visibility = "hidden";
       applyCollectionDeletions();
+      if (grid) grid.style.visibility = "";
       applyCollectionFavStates();
       refreshCountryList();
       applyFilters();
@@ -1791,6 +2459,12 @@
     } else {
       section.style.display = "none";
       collectionTabWasSeen = false;
+      stopDeletionObserver();
+      // Cancel any pending idle filter — DOM is no longer visible, stale run would be wasteful.
+      cancelIdleFilter();
+      // Clear metadata cache — DOM may differ on next tab activation (React may remount cards).
+      clearCardMetaCache();
+      _lastCountryCardCount = 0;
     }
   }
 
@@ -1807,16 +2481,12 @@
   }
 
   // MutationObserver — debounced so rapid DOM mutations during page load don't cascade
-  let debounceTimer = null;
-  const observer = new MutationObserver(() => {
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-      tryStart();
-      updatePackDisplay();
-      syncFilterSection();
-      tryScrapePack();
-    }, 300);
-  });
+  const observer = new MutationObserver(debounce(() => {
+    tryStart();
+    updatePackDisplay();
+    syncFilterSection();
+    tryScrapePack();
+  }, 300));
   observer.observe(document.body, {
     childList: true,
     subtree: true,
@@ -1826,7 +2496,7 @@
 
   // Re-clamp panel position on window resize so it can't go off-screen
   window.addEventListener("resize", () => {
-    const p = document.getElementById("gcb-panel");
+    const p = DOMCache.get("gcb-panel");
     if (!p || p.style.display === "none") return;
     const rect = p.getBoundingClientRect();
     const x = Math.max(
