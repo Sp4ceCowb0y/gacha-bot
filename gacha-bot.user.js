@@ -939,7 +939,6 @@
   function applyCollectionDeletions() {
     const deleted = loadCollectionDeleted();
     if (!deleted.size) return;
-    let changed = false;
     for (const w of getCardWrappers()) {
       const a = w.querySelector("a[href]");
       if (!a) continue;
@@ -947,14 +946,8 @@
       if (!m) continue;
       const id = parseInt(m[1]);
       if (!deleted.has(id)) continue;
-      // Card is present in the live collection — user re-acquired it.
-      // Remove from the deleted set so it stops being hidden.
-      deleted.delete(id);
-      changed = true;
-    }
-    if (changed) {
-      saveCollectionDeleted(deleted);
-      updateDeletedCssRules(deleted);
+      // Re-stamp the attribute — React re-renders lose it on each DOM refresh.
+      w.dataset.gcbDeleted = "true";
     }
   }
 
@@ -2118,12 +2111,14 @@
         if (getCardWrappers().length === before) break;
         await sleep(200);
         refreshCountryList(true); // incremental — only scan newly added cards
+        applyCollectionDeletions();
         applyFilters();
         loadMore = findLoadMoreButton();
       }
     } finally {
       loadingAllCards = false;
       refreshCountryList();
+      applyCollectionDeletions();
       applyFilters();
     }
   }
