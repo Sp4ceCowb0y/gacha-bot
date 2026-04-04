@@ -271,6 +271,53 @@
     else clearTimeout(handle);
   }
 
+  // Resolves when the card grid has more children than countBefore, or after timeoutMs.
+  // Uses MutationObserver instead of setInterval polling — zero CPU cost between DOM events.
+  function waitForNewCards(grid, countBefore, timeoutMs) {
+    return new Promise((resolve) => {
+      if (!grid) {
+        // Grid not found (tab switched away?) — fall back to a plain sleep.
+        setTimeout(resolve, Math.min(timeoutMs, 500));
+        return;
+      }
+      let timer = null;
+      const obs = new MutationObserver(() => {
+        if (getCardWrappers().length > countBefore) {
+          obs.disconnect();
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+      obs.observe(grid, { childList: true });
+      timer = setTimeout(() => {
+        obs.disconnect();
+        resolve();
+      }, timeoutMs);
+    });
+  }
+
+  // Yields to the browser for at least minDelayMs.
+  // Races requestIdleCallback against a minimum sleep so React always gets
+  // at least minDelayMs to reconcile before the next "Load more" click,
+  // but the browser can process input / paint while we wait.
+  function waitForIdle(minDelayMs) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (!done) { done = true; resolve(); }
+      };
+      // Minimum floor — ensures React has time to reconcile even if idle fires early.
+      const minTimer = setTimeout(finish, minDelayMs);
+      if (typeof requestIdleCallback === "function") {
+        requestIdleCallback(() => {
+          clearTimeout(minTimer);
+          finish();
+        }, { timeout: minDelayMs });
+      }
+      // If no rIC support, minTimer alone resolves after minDelayMs.
+    });
+  }
+
   // ═══════════════════════════════════════════════════════════════
   //  PERSISTED STATE
   // ═══════════════════════════════════════════════════════════════
@@ -2121,6 +2168,8 @@
         );
       }
 
+      const grid = document.querySelector("#tabs-content-collection .grid");
+
       while (loadMore) {
         const before = getCardWrappers().length;
         const remaining = loadMore.innerText.match(/\d+/);
@@ -2128,19 +2177,12 @@
         setFilterStatus(`Loading… ${before} / ${total}`, "#60a5fa");
         loadMore.click();
 
-        // Wait up to 5s for new cards to appear
-        await new Promise((resolve) => {
-          const deadline = Date.now() + 5000;
-          const id = setInterval(() => {
-            if (getCardWrappers().length > before || Date.now() > deadline) {
-              clearInterval(id);
-              resolve();
-            }
-          }, 200);
-        });
+        // Wait for new cards using MutationObserver — zero CPU between DOM events.
+        await waitForNewCards(grid, before, 5000);
 
         if (getCardWrappers().length === before) break;
-        await sleep(200);
+        // Yield to the browser so React can finish reconciling and the user can interact.
+        await waitForIdle(150);
         // Deletions must be stamped synchronously — CSS and applyFilters both depend on the attribute.
         applyCollectionDeletions();
         // Country scan is fast (new wrappers only) — keep it synchronous so _lastCountryCardCount stays consistent.
