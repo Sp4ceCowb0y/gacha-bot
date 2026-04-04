@@ -515,7 +515,11 @@
         filterState.rarities.size === 0 ||
         (rarity && filterState.rarities.has(rarity));
       const shinyOk = !filterState.shinyOnly || shiny;
-      // data-gcb-fav is stamped by applyCollectionFavStates() before filters run — no DOM query needed.
+      // data-gcb-fav is stamped by applyCollectionFavStates() on tab activation.
+      // Cards added in later batches may not have been stamped yet — lazy-stamp them now.
+      if (w.dataset.gcbFav === undefined) {
+        w.dataset.gcbFav = !!w.querySelector('button[title="Unfavorite"]') ? "true" : "false";
+      }
       const isFav = w.dataset.gcbFav === "true";
       const favOk =
         filterState.favsMode === "only" ? isFav :
@@ -977,6 +981,9 @@
         w.dataset.gcbFav = "true";
       } else if (stored?.fav === false) {
         w.dataset.gcbFav = "false";
+      } else {
+        // No stored record — derive from native button and stamp so filters can rely on the attribute.
+        w.dataset.gcbFav = nativeFav ? "true" : "false";
       }
     }
   }
