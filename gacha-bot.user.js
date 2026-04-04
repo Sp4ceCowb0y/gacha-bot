@@ -13,7 +13,21 @@
 // ───────────────────────────────────────────────────────────────────
 //  CHANGELOG
 // ───────────────────────────────────────────────────────────────────
-//  v1.34 Add: clicking anywhere outside the history panel now closes it.
+//  v1.34 Perf: remove CSS :has() rules injected by updateDeletedCssRules(). Firefox's
+//        relative selector invalidation re-evaluated every :has() rule on every DOM
+//        mutation, causing 5 × ~10-second LongTasks during loadAllCards() (confirmed
+//        via Firefox profiler: ~70% CPU in style::invalidation::element::relative_selector::*).
+//        Fix: rely solely on the existing [data-gcb-deleted="true"] { display:none }
+//        attribute selector in injectStyles() — no relative-selector invalidation cost.
+//        Flash prevention (v1.22) is replaced by: (a) hiding the collection grid while
+//        applyCollectionDeletions() runs synchronously on tab activation, and (b) a
+//        MutationObserver that pre-stamps data-gcb-deleted on cards React adds to the
+//        grid while the tab is active (MutationObserver callbacks fire before paint).
+//        Perf: history window now opens immediately — modal is shown before DOM is
+//        built, first 5 packs render synchronously, remaining packs render in async
+//        batches of 8. All card images (avatar + flag) use loading="lazy" so only
+//        visible images load on open, eliminating the ~75k parallel image loads.
+//        Add: clicking anywhere outside the history panel now closes it.
 //        Add: "Remember Deleted" blacklist in the Auto-Delete panel. When enabled,
 //        deleted cards matching the configured rarities (default: legendary + epic)
 //        are stored in gcb-blacklist and auto-deleted whenever they are repulled,
@@ -818,7 +832,7 @@
     const ids = loadCollectionDeleted();
     ids.add(playerId);
     saveCollectionDeleted(ids);
-    updateDeletedCssRules(ids);
+    removeCardFromCollectionDom(playerId);
   }
 
   // ─── Auto-delete config ────────────────────────────────────────────────────
@@ -992,22 +1006,13 @@
   }
   installFetchHook();
 
-  // Injects/updates a <style> with :has() rules for every deleted player ID.
-  // CSS is applied by the browser before paint, so cards are never visible even
-  // for a single frame when React renders the collection tab from RSC cache.
-  function updateDeletedCssRules(ids) {
-    if (!ids) ids = loadCollectionDeleted();
-    let el = DOMCache.get("gcb-deleted-rules");
-    if (!el) {
-      el = document.createElement("style");
-      el.id = "gcb-deleted-rules";
-      document.head.appendChild(el);
-    }
-    if (!ids.size) { el.textContent = ""; return; }
-    el.textContent = [...ids].map(id =>
-      `#tabs-content-collection .grid > .relative:has(a[href$="/users/${id}"], a[href*="/users/${id}/"]) { display: none !important; }`
-    ).join("\n");
-  }
+  // updateDeletedCssRules() was removed in v1.34.
+  // It injected per-ID CSS :has() rules that caused Firefox to spend ~70% of CPU in
+  // style::invalidation::element::relative_selector::* on every DOM mutation, producing
+  // five ~10-second LongTasks during loadAllCards(). Flash prevention is now handled
+  // by hiding the collection grid while applyCollectionDeletions() runs synchronously,
+  // and by startDeletionObserver() which pre-stamps data-gcb-deleted before paint.
+  function updateDeletedCssRules() { /* removed in v1.34 — see changelog */ }
 
   // Called every time the Collection tab activates — stamps data-gcb-deleted on
   // cards whose player IDs were recorded as deleted via the history panel.
@@ -1027,6 +1032,37 @@
       // Re-stamp the attribute — React re-renders lose it on each DOM refresh.
       w.dataset.gcbDeleted = "true";
     }
+  }
+
+  // Watches the collection grid and pre-stamps data-gcb-deleted on any card React
+  // adds while the tab is active. MutationObserver callbacks fire after DOM mutations
+  // but before the browser's next paint, so deleted cards are never visible.
+  let _deletionObserver = null;
+  function startDeletionObserver() {
+    if (_deletionObserver) return;
+    const grid = document.querySelector("#tabs-content-collection .grid");
+    if (!grid) return;
+    _deletionObserver = new MutationObserver((mutations) => {
+      const deleted = loadCollectionDeleted();
+      if (!deleted.size) return;
+      for (const mutation of mutations) {
+        for (const node of mutation.addedNodes) {
+          if (node.nodeType !== 1) continue;
+          const a = node.querySelector("a[href]");
+          if (!a) continue;
+          const m = a.href.match(/\/users\/(\d+)/);
+          if (m && deleted.has(parseInt(m[1]))) {
+            node.dataset.gcbDeleted = "true";
+          }
+        }
+      }
+    });
+    _deletionObserver.observe(grid, { childList: true });
+  }
+  function stopDeletionObserver() {
+    if (!_deletionObserver) return;
+    _deletionObserver.disconnect();
+    _deletionObserver = null;
   }
 
   // Called every time the Collection tab activates — stamps data-gcb-fav on each
@@ -1139,6 +1175,7 @@
     const img = document.createElement("img");
     img.src = card.avatar;
     img.alt = card.name;
+    img.loading = "lazy";
     img.style.cssText =
       "width:100%;aspect-ratio:1;object-fit:cover;display:block;";
     img.onerror = () => {
@@ -1150,6 +1187,7 @@
     info.style.cssText = "padding:6px 6px 7px;text-align:center;";
     const flagHtml = card.country
       ? `<img src="https://cdn.jsdelivr.net/gh/lipis/flag-icons/flags/4x3/${card.country}.svg"
+              loading="lazy"
               style="height:10px;vertical-align:middle;margin-right:3px;border-radius:1px;"
               onerror="this.style.display='none'">`
       : "";
@@ -1312,10 +1350,27 @@
     return section;
   }
 
+  // Generation counter — incremented on each renderHistory() call so that
+  // deferred batches from a previous render don't append to a re-cleared body.
+  let _histRenderGen = 0;
+
+  function _renderHistoryBatch(body, history, startIdx, gen) {
+    if (gen !== _histRenderGen) return; // stale batch — body was cleared since
+    const BATCH_SIZE = 8;
+    const end = Math.max(-1, startIdx - BATCH_SIZE);
+    for (let i = startIdx; i > end; i--) {
+      body.appendChild(buildPackSection(history[i]));
+    }
+    if (end >= 0) {
+      setTimeout(() => _renderHistoryBatch(body, history, end, gen), 0);
+    }
+  }
+
   function renderHistory() {
     const body = DOMCache.get("gcb-hist-body");
     if (!body) return [];
     const history = loadHistory();
+    const gen = ++_histRenderGen;
 
     if (!history.length) {
       body.innerHTML =
@@ -1324,8 +1379,16 @@
     }
 
     body.innerHTML = "";
-    for (let i = history.length - 1; i >= 0; i--) {
+    const last = history.length - 1;
+    // Render the 5 newest packs synchronously so the modal appears immediately
+    // with visible content, then defer the rest in batches.
+    const INITIAL = 5;
+    const syncEnd = Math.max(-1, last - INITIAL);
+    for (let i = last; i > syncEnd; i--) {
       body.appendChild(buildPackSection(history[i]));
+    }
+    if (syncEnd >= 0) {
+      setTimeout(() => _renderHistoryBatch(body, history, syncEnd, gen), 0);
     }
     return history;
   }
@@ -1848,12 +1911,14 @@
     panel.querySelector("#gcb-hist-open").addEventListener("click", () => {
       const modal = DOMCache.get("gcb-history-modal");
       if (!modal) return;
+      // Show the modal before rendering so it appears immediately; renderHistory
+      // renders the first few packs synchronously then defers the rest.
+      modal.style.display = "flex";
+      historyWindowOpen = true;
       const history = renderHistory();
       const hasMythics = history.some(p => p.cards.some(c => c.rarity === "mythic"));
       const mythicBtn = modal.querySelector("#gcb-hist-mythic-btn");
       if (mythicBtn) mythicBtn.style.display = hasMythics ? "inline-flex" : "none";
-      modal.style.display = "flex";
-      historyWindowOpen = true;
     });
 
     // ── Auto-open toggle ──
@@ -2355,7 +2420,6 @@
   // ═══════════════════════════════════════════════════════════════
 
   injectStyles();
-  updateDeletedCssRules(); // restore :has() hide rules from localStorage immediately
   const panel = buildPanel();
   buildFab();
   buildHistoryModal();
@@ -2370,7 +2434,16 @@
     if (!section) return;
     if (isCollectionTabActive()) {
       section.style.display = "block";
+      // Start the observer before stamping so it catches any cards React adds
+      // in subsequent mutations while the tab stays open.
+      startDeletionObserver();
+      // Briefly hide the grid while we stamp data-gcb-deleted. Both the hide and
+      // the attribute stamps are synchronous — the browser batches them into one
+      // paint, so deleted cards are never visible even for a single frame.
+      const grid = document.querySelector("#tabs-content-collection .grid");
+      if (grid) grid.style.visibility = "hidden";
       applyCollectionDeletions();
+      if (grid) grid.style.visibility = "";
       applyCollectionFavStates();
       refreshCountryList();
       applyFilters();
@@ -2386,6 +2459,7 @@
     } else {
       section.style.display = "none";
       collectionTabWasSeen = false;
+      stopDeletionObserver();
       // Cancel any pending idle filter — DOM is no longer visible, stale run would be wasteful.
       cancelIdleFilter();
       // Clear metadata cache — DOM may differ on next tab activation (React may remount cards).
