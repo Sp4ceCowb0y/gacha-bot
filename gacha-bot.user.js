@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GachaBot
 // @namespace    http://tampermonkey.net/
-// @version      1.34
+// @version      1.35
 // @description  Auto-open packs + collection filter panel for gacha.miz.to
 // @author       Sp4ceCowb0y
 // @match        https://gacha.miz.to/*
@@ -13,6 +13,18 @@
 // ───────────────────────────────────────────────────────────────────
 //  CHANGELOG
 // ───────────────────────────────────────────────────────────────────
+//  v1.35 Fix: detect renamed "Show next N" pagination button (was "Load more").
+//        Fix: isShiny() now also detects the ✨ badge div added outside the <a>
+//        tag in the new site card layout.
+//        Fix: history-panel delete now handles the new inline "Delete 1 copy / No"
+//        confirm overlay (replaced the old Yes/No Radix portal). Native delete
+//        button lookup updated to prefer button[title="Delete"].
+//        Improve: blacklist modal now shows card tiles with avatar image, rarity
+//        border, flag and name — matching the history window style. Each tile has
+//        a ✕ button to remove that card from the blacklist. Avatar is now stored
+//        in both the blacklist entry and the card meta cache so tiles display
+//        correctly for cards deleted via the site's native UI.
+//
 //  v1.34 Perf: remove CSS :has() rules injected by updateDeletedCssRules(). Firefox's
 //        relative selector invalidation re-evaluated every :has() rule on every DOM
 //        mutation, causing 5 × ~10-second LongTasks during loadAllCards() (confirmed
@@ -53,8 +65,7 @@
 //        user typed a country/name and opened a pack before clicking away, the
 //        config was stale. Changed to "input" so config saves on every keystroke.
 //        (3) inline onclick="stopPropagation()" on the toggle label was likely
-//        blocked by site CSP — replaced with a JS addEventListener. Added
-//        console.log to runAutoDelete showing the live config per pack.
+//        blocked by site CSP — replaced with a JS addEventListener.
 //
 //  v1.28 Fix: auto-deleted cards now show DELETED banner in pack history tiles.
 //        runAutoDelete now receives the pack timestamp and calls
@@ -219,7 +230,14 @@
   const POLL_RATE_MS = 300;
   const FALLBACK_CHECK_MS = 5 * 1000;
 
-  const RARITIES = ["mythic", "legendary", "epic", "rare", "uncommon", "common"];
+  const RARITIES = [
+    "mythic",
+    "legendary",
+    "epic",
+    "rare",
+    "uncommon",
+    "common",
+  ];
   const RARITY_COLORS = {
     mythic: "#ef4444",
     legendary: "#fcd34d",
@@ -259,7 +277,9 @@
       if (el && document.contains(el)) return el;
       return (this._c[id] = document.getElementById(id));
     },
-    clear() { this._c = {}; },
+    clear() {
+      this._c = {};
+    },
   };
 
   // Returns a debounced wrapper that delays fn until ms ms after the last call.
@@ -318,15 +338,21 @@
     return new Promise((resolve) => {
       let done = false;
       const finish = () => {
-        if (!done) { done = true; resolve(); }
+        if (!done) {
+          done = true;
+          resolve();
+        }
       };
       // Minimum floor — ensures React has time to reconcile even if idle fires early.
       const minTimer = setTimeout(finish, minDelayMs);
       if (typeof requestIdleCallback === "function") {
-        requestIdleCallback(() => {
-          clearTimeout(minTimer);
-          finish();
-        }, { timeout: minDelayMs });
+        requestIdleCallback(
+          () => {
+            clearTimeout(minTimer);
+            finish();
+          },
+          { timeout: minDelayMs },
+        );
       }
       // If no rIC support, minTimer alone resolves after minDelayMs.
     });
@@ -550,7 +576,9 @@
     _cardMeta.set(wrapper, meta);
     return meta;
   }
-  function clearCardMetaCache() { _cardMeta = new WeakMap(); }
+  function clearCardMetaCache() {
+    _cardMeta = new WeakMap();
+  }
 
   // Coalescing idle filter scheduler — ensures at most one pending applyFilters call
   // is queued at a time. Subsequent calls before the idle callback fires are no-ops.
@@ -585,9 +613,15 @@
   }
 
   function isShiny(card) {
-    // Legendary rarity shimmer: animate-[shimmer_4s_...] — no rounded-md
-    // Shiny card shimmer:       animate-[shimmer_3s_...] rounded-md  ← unique marker
-    return !!card.querySelector('[class*="shimmer"][class*="rounded-md"]');
+    // Primary: shimmer overlay with rounded-md — unique to shiny cards.
+    // Legendary shimmer uses 4s duration without rounded-md so it never matches.
+    if (card.querySelector('[class*="shimmer"][class*="rounded-md"]')) return true;
+    // Fallback: ✨ badge div added as a direct child of the card wrapper in the
+    // new site layout (outside the <a> tag, alongside the fav/delete buttons).
+    for (const el of card.querySelectorAll(":scope > div")) {
+      if (el.textContent.trim() === "✨") return true;
+    }
+    return false;
   }
 
   function applyFilters() {
@@ -610,13 +644,17 @@
       // data-gcb-fav is stamped by applyCollectionFavStates() on tab activation.
       // Cards added in later batches may not have been stamped yet — lazy-stamp them now.
       if (w.dataset.gcbFav === undefined) {
-        w.dataset.gcbFav = !!w.querySelector('button[title="Unfavorite"]') ? "true" : "false";
+        w.dataset.gcbFav = !!w.querySelector('button[title="Unfavorite"]')
+          ? "true"
+          : "false";
       }
       const isFav = w.dataset.gcbFav === "true";
       const favOk =
-        filterState.favsMode === "only" ? isFav :
-        filterState.favsMode === "hide" ? !isFav :
-        true;
+        filterState.favsMode === "only"
+          ? isFav
+          : filterState.favsMode === "hide"
+            ? !isFav
+            : true;
       const show = countryOk && rarityOk && shinyOk && favOk;
       w.style.display = show ? "" : "none";
       if (show) visible++;
@@ -649,7 +687,7 @@
   let currentPackFp = null;
   let overlayGoneTimer = null; // debounce for overlay-close detection
   let historyWindowOpen = false; // tracks whether the history panel is visible
-  let mythicWindowOpen = false;  // tracks whether the mythic pulls panel is visible
+  let mythicWindowOpen = false; // tracks whether the mythic pulls panel is visible
 
   function packFingerprint(cards) {
     return cards
@@ -706,7 +744,7 @@
     saveHistory(hist);
     await runAutoDelete(cards, packTs); // wait so deleted state is stamped before building tiles
     if (historyWindowOpen) prependPackToHistory({ timestamp: packTs, cards });
-    const mythics = cards.filter(c => c.rarity === "mythic");
+    const mythics = cards.filter((c) => c.rarity === "mythic");
     if (mythics.length) {
       showMythicNotification(mythics);
       if (mythicWindowOpen) prependMythicCards(mythics);
@@ -851,7 +889,7 @@
     try {
       const raw = JSON.parse(localStorage.getItem(BL_CFG_KEY) || "{}");
       return {
-        enabled:  !!raw.enabled,
+        enabled: !!raw.enabled,
         rarities: new Set(raw.rarities || ["legendary", "epic"]),
       };
     } catch {
@@ -859,10 +897,13 @@
     }
   }
   function saveBlacklistConfig(cfg) {
-    localStorage.setItem(BL_CFG_KEY, JSON.stringify({
-      enabled:  cfg.enabled,
-      rarities: [...cfg.rarities],
-    }));
+    localStorage.setItem(
+      BL_CFG_KEY,
+      JSON.stringify({
+        enabled: cfg.enabled,
+        rarities: [...cfg.rarities],
+      }),
+    );
   }
 
   // Add a card to the blacklist if blacklisting is enabled and the card's
@@ -872,13 +913,18 @@
     if (!cfg.enabled) return;
     if (!cfg.rarities.has(card.rarity)) return;
     const bl = loadBlacklist();
-    bl[card.id] = { name: card.name, rarity: card.rarity, country: card.country };
+    bl[card.id] = {
+      name: card.name,
+      rarity: card.rarity,
+      country: card.country,
+      avatar: card.avatar || "",
+    };
     saveBlacklist(bl);
   }
 
   // ─── Card metadata cache ───────────────────────────────────────────────────
-  // Persists { name, rarity, country } keyed by player ID so the fetch hook can
-  // look up card details when a native deletion is intercepted.
+  // Persists { name, rarity, country, avatar } keyed by player ID so the fetch
+  // hook can look up card details when a native deletion is intercepted.
   const CARD_META_KEY = "gcb-card-meta";
   function loadCardMeta() {
     return StorageUtils.getJSON(CARD_META_KEY);
@@ -886,7 +932,12 @@
   function cacheCardMeta(card) {
     if (!card.id || !card.name) return;
     const meta = loadCardMeta();
-    meta[card.id] = { name: card.name, rarity: card.rarity, country: card.country };
+    meta[card.id] = {
+      name: card.name,
+      rarity: card.rarity,
+      country: card.country,
+      avatar: card.avatar || "",
+    };
     StorageUtils.setJSON(CARD_META_KEY, meta);
   }
   function lookupCardMeta(playerId) {
@@ -909,30 +960,39 @@
     try {
       const raw = JSON.parse(localStorage.getItem(AD_KEY) || "{}");
       return {
-        enabled:    !!raw.enabled,
+        enabled: !!raw.enabled,
         rarityMode: raw.rarityMode || "include",
-        rarities:   new Set(raw.rarities || []),
-        natMode:    raw.natMode    || "include",
-        nations:    new Set(raw.nations   || []),
-        whitelist:  new Set((raw.whitelist || []).map(n => n.toLowerCase().normalize("NFC"))),
+        rarities: new Set(raw.rarities || []),
+        natMode: raw.natMode || "include",
+        nations: new Set(raw.nations || []),
+        whitelist: new Set(
+          (raw.whitelist || []).map((n) => n.toLowerCase().normalize("NFC")),
+        ),
       };
     } catch {
       return {
-        enabled: false, rarityMode: "include", rarities: new Set(),
-        natMode: "include", nations: new Set(), whitelist: new Set(),
+        enabled: false,
+        rarityMode: "include",
+        rarities: new Set(),
+        natMode: "include",
+        nations: new Set(),
+        whitelist: new Set(),
       };
     }
   }
 
   function saveAutoDeleteConfig(cfg) {
-    localStorage.setItem(AD_KEY, JSON.stringify({
-      enabled:    cfg.enabled,
-      rarityMode: cfg.rarityMode,
-      rarities:   [...cfg.rarities],
-      natMode:    cfg.natMode,
-      nations:    [...cfg.nations],
-      whitelist:  [...cfg.whitelist],
-    }));
+    localStorage.setItem(
+      AD_KEY,
+      JSON.stringify({
+        enabled: cfg.enabled,
+        rarityMode: cfg.rarityMode,
+        rarities: [...cfg.rarities],
+        natMode: cfg.natMode,
+        nations: [...cfg.nations],
+        whitelist: [...cfg.whitelist],
+      }),
+    );
   }
 
   // Returns true if the card should be auto-deleted given the config.
@@ -941,10 +1001,11 @@
   // the other is ignored (passes freely).
   function shouldAutoDelete(card, cfg) {
     if (!cfg.enabled) return false;
-    if (cfg.whitelist.has((card.name || "").toLowerCase().normalize("NFC"))) return false;
+    if (cfg.whitelist.has((card.name || "").toLowerCase().normalize("NFC")))
+      return false;
 
     const hasRarityFilter = cfg.rarities.size > 0;
-    const hasNatFilter    = cfg.nations.size  > 0;
+    const hasNatFilter = cfg.nations.size > 0;
     if (!hasRarityFilter && !hasNatFilter) return false; // nothing configured → do nothing
 
     if (hasRarityFilter) {
@@ -962,7 +1023,6 @@
   // auto-delete rules. Runs in the background so it doesn't block the observer.
   async function runAutoDelete(cards, packTs) {
     const cfg = loadAutoDeleteConfig();
-    console.log(`[GachaBot] runAutoDelete: enabled=${cfg.enabled}, rarities=[${[...cfg.rarities]}], natMode=${cfg.natMode}, nations=[${[...cfg.nations]}], cards=${cards.map(c => `${c.name}(${c.rarity},${c.country})`).join(", ")}`);
     if (!cfg.enabled) return;
     for (const card of cards) {
       if (!shouldAutoDelete(card, cfg) && !isBlacklisted(card.id)) continue;
@@ -971,7 +1031,6 @@
         markCollectionDeleted(card.id);
         if (packTs) saveDeletedInstance(packTs, card.id);
         addToBlacklist(card);
-        console.log(`[GachaBot] Auto-deleted: ${card.name} (${card.rarity}, ${card.country})`);
       }
     }
   }
@@ -986,11 +1045,13 @@
       try {
         const [input, init] = args;
         const url = typeof input === "string" ? input : input?.url || "";
-        const method = (init?.method || (input?.method) || "GET").toUpperCase();
+        const method = (init?.method || input?.method || "GET").toUpperCase();
         if (method === "DELETE" && url.includes("/api/collection") && res.ok) {
           const body = init?.body || input?.body;
           if (body) {
-            const parsed = JSON.parse(typeof body === "string" ? body : await new Response(body).text());
+            const parsed = JSON.parse(
+              typeof body === "string" ? body : await new Response(body).text(),
+            );
             for (const id of parsed.playerIds || []) {
               markCollectionDeleted(id);
               const meta = lookupCardMeta(id);
@@ -1012,7 +1073,9 @@
   // five ~10-second LongTasks during loadAllCards(). Flash prevention is now handled
   // by hiding the collection grid while applyCollectionDeletions() runs synchronously,
   // and by startDeletionObserver() which pre-stamps data-gcb-deleted before paint.
-  function updateDeletedCssRules() { /* removed in v1.34 — see changelog */ }
+  function updateDeletedCssRules() {
+    /* removed in v1.34 — see changelog */
+  }
 
   // Called every time the Collection tab activates — stamps data-gcb-deleted on
   // cards whose player IDs were recorded as deleted via the history panel.
@@ -1112,6 +1175,32 @@
       if (w.querySelector(`a[href*="/users/${playerId}"]`)) return w;
     }
     return null;
+  }
+
+  // Wait for the inline delete-copy confirm overlay to appear inside cardEl and
+  // click the confirm button ("Delete 1 copy" / "Delete N copies").
+  // Falls back to a document-wide "Yes" search for any older Radix portal dialog.
+  async function clickDeleteConfirm(cardEl, timeoutMs = 3000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const scope = cardEl || document;
+      for (const btn of scope.querySelectorAll("button")) {
+        const t = (btn.innerText || "").trim().toLowerCase();
+        if (t.startsWith("delete ") && !btn.disabled) {
+          btn.click();
+          return true;
+        }
+      }
+      // Old fallback: Radix "Yes" portal
+      for (const btn of document.querySelectorAll("button")) {
+        if ((btn.innerText || "").trim().toLowerCase() === "yes" && !btn.disabled) {
+          btn.click();
+          return true;
+        }
+      }
+      await sleep(100);
+    }
+    return false;
   }
 
   // Wait for a confirmation button with the given text and click it.
@@ -1290,14 +1379,16 @@
       delBtn.disabled = true;
 
       // Prefer clicking the native 🗑 button so React handles the API call and
-      // collection state update. The native button triggers a Yes/No dialog.
-      // Native delete button: right-positioned (right-0.5 in class).
+      // collection state update. The native button shows an inline confirm overlay
+      // ("Delete 1 copy" / "No") inside the card wrapper.
       const collCard = findCollectionCard(card.id);
-      const nativeDelBtn = collCard?.querySelector('button[class*="right-0.5"]');
+      const nativeDelBtn =
+        collCard?.querySelector('button[title="Delete"]') ||
+        collCard?.querySelector('button[class*="right-0.5"]');
       let ok = false;
       if (nativeDelBtn) {
         nativeDelBtn.click();
-        ok = await clickDialogButton("Yes");
+        ok = await clickDeleteConfirm(collCard);
         if (!ok) {
           // Dialog didn't appear or user path failed — abort without changing state
           delBtn.textContent = "✕ Del";
@@ -1436,7 +1527,9 @@
 
     function dismiss() {
       toast.classList.add("gcb-closing");
-      toast.addEventListener("animationend", () => toast.remove(), { once: true });
+      toast.addEventListener("animationend", () => toast.remove(), {
+        once: true,
+      });
     }
     toast.addEventListener("click", dismiss);
     const timer = setTimeout(dismiss, 6000);
@@ -1489,17 +1582,23 @@
     const body = DOMCache.get("gcb-mythic-body");
     if (!body) return;
     const history = loadHistory();
-    const mythics = history.flatMap(pack =>
-      pack.cards.filter(c => c.rarity === "mythic").map(c => ({ ...c, packTs: pack.timestamp }))
-    ).reverse();
+    const mythics = history
+      .flatMap((pack) =>
+        pack.cards
+          .filter((c) => c.rarity === "mythic")
+          .map((c) => ({ ...c, packTs: pack.timestamp })),
+      )
+      .reverse();
     if (!mythics.length) {
-      body.innerHTML = '<p style="color:#4b5563;text-align:center;padding:48px 0;font-size:13px;">No mythic cards pulled yet.</p>';
+      body.innerHTML =
+        '<p style="color:#4b5563;text-align:center;padding:48px 0;font-size:13px;">No mythic cards pulled yet.</p>';
       return;
     }
     body.innerHTML = "";
     const grid = document.createElement("div");
     grid.style.cssText = "display:flex;flex-wrap:wrap;gap:8px;";
-    for (const card of mythics) grid.appendChild(buildCardTile(card, card.packTs));
+    for (const card of mythics)
+      grid.appendChild(buildCardTile(card, card.packTs));
     body.appendChild(grid);
   }
 
@@ -1522,21 +1621,21 @@
     const modal = document.createElement("div");
     modal.id = "gcb-bl-modal";
     modal.style.cssText = `
-      display:none; position:fixed; right:302px; top:260px; z-index:20001;
-      width:320px; max-height:70vh;
-      background:#0a0f1a; border:1px solid #1f2937; border-radius:14px;
+      display:none; position:fixed; right:302px; top:64px; z-index:20001;
+      width:900px; max-height:85vh;
+      background:#0a0f1a; border:1px solid #1f2937; border-radius:16px;
       overflow:hidden; flex-direction:column;
       box-shadow:0 8px 32px rgba(0,0,0,0.7);
     `;
     modal.innerHTML = `
       <div id="gcb-bl-modal-header" style="display:flex;align-items:center;justify-content:space-between;
-           padding:12px 16px;background:#0d1525;border-bottom:1px solid #1f2937;
+           padding:14px 20px;background:#0d1525;border-bottom:1px solid #1f2937;
            cursor:grab;user-select:none;flex-shrink:0;">
         <span style="font-weight:800;font-size:11px;letter-spacing:2.5px;color:#9ca3af;text-transform:uppercase;">Blacklist</span>
         <button id="gcb-bl-modal-close" style="background:none;border:none;
             color:#4b5563;cursor:pointer;font-size:15px;line-height:1;padding:0;">✕</button>
       </div>
-      <div id="gcb-bl-modal-body" style="padding:10px 14px;overflow-y:auto;flex:1;"></div>
+      <div id="gcb-bl-modal-body" style="padding:18px 20px;overflow-y:auto;flex:1;"></div>
     `;
     document.body.appendChild(modal);
 
@@ -1544,7 +1643,71 @@
       modal.style.display = "none";
     });
     makeDraggable(modal, modal.querySelector("#gcb-bl-modal-header"));
+
+    // Close when clicking outside the modal
+    document.addEventListener("mousedown", (e) => {
+      if (modal.style.display !== "none" && !modal.contains(e.target)) {
+        modal.style.display = "none";
+      }
+    });
+
     return modal;
+  }
+
+  function buildBlacklistCardTile(id, data, onRemove) {
+    const rarityColor = RARITY_COLORS[data.rarity] || "#9ca3af";
+
+    const tile = document.createElement("div");
+    tile.style.cssText = `
+      position:relative; width:160px; background:#0d1525;
+      border:2px solid ${rarityColor}; border-radius:8px;
+      overflow:hidden;
+    `;
+
+    const img = document.createElement("img");
+    img.src = data.avatar || "";
+    img.alt = data.name;
+    img.loading = "lazy";
+    img.style.cssText =
+      "width:100%;aspect-ratio:1;object-fit:cover;display:block;";
+    img.onerror = () => {
+      img.style.background = "#1f2937";
+      img.src = "";
+    };
+
+    const flagHtml = data.country
+      ? `<img src="https://cdn.jsdelivr.net/gh/lipis/flag-icons/flags/4x3/${data.country}.svg"
+              loading="lazy"
+              style="height:10px;vertical-align:middle;margin-right:3px;border-radius:1px;"
+              onerror="this.style.display='none'">`
+      : "";
+
+    const info = document.createElement("div");
+    info.style.cssText = "padding:6px 6px 7px;text-align:center;";
+    info.innerHTML = `
+      <div style="font-size:10px;color:${rarityColor};text-transform:uppercase;letter-spacing:1.5px;
+           white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${data.rarity || "—"}</div>
+      <div style="font-size:12px;color:#f9fafb;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600;"
+           title="${data.name}">${flagHtml}${data.name}</div>
+    `;
+
+    const removeBtn = document.createElement("button");
+    removeBtn.textContent = "✕";
+    removeBtn.title = "Remove from blacklist";
+    removeBtn.style.cssText = `
+      position:absolute; top:4px; right:4px;
+      background:rgba(0,0,0,0.65); border:1px solid #ef444460;
+      border-radius:50%; width:20px; height:20px;
+      font-size:10px; color:#ef4444; cursor:pointer;
+      display:flex; align-items:center; justify-content:center;
+      line-height:1; padding:0;
+    `;
+    removeBtn.addEventListener("click", () => onRemove(id, tile));
+
+    tile.appendChild(img);
+    tile.appendChild(info);
+    tile.appendChild(removeBtn);
+    return tile;
   }
 
   function renderBlacklistModal(onChangeCallback) {
@@ -1553,32 +1716,29 @@
     const bl = loadBlacklist();
     const entries = Object.entries(bl);
     if (!entries.length) {
-      body.innerHTML = '<p style="color:#4b5563;text-align:center;padding:24px 0;font-size:12px;">Blacklist is empty.</p>';
+      body.innerHTML =
+        '<p style="color:#4b5563;text-align:center;padding:48px 0;font-size:13px;">Blacklist is empty.</p>';
       return;
     }
+
     body.innerHTML = "";
+    const grid = document.createElement("div");
+    grid.style.cssText = "display:flex;flex-wrap:wrap;gap:8px;";
+
     for (const [id, data] of entries) {
-      const color = RARITY_COLORS[data.rarity] || "#9ca3af";
-      const row = document.createElement("div");
-      row.style.cssText = "display:flex;align-items:center;justify-content:space-between;padding:5px 4px;border-bottom:1px solid #111827;";
-      row.innerHTML = `
-        <div style="display:flex;align-items:center;gap:6px;overflow:hidden;">
-          <span style="width:7px;height:7px;border-radius:50%;background:${color};flex-shrink:0;display:inline-block;"></span>
-          <span style="font-size:12px;color:#d1d5db;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${data.name}">${data.name}</span>
-        </div>
-        <button data-id="${id}" style="font-size:10px;color:#ef4444;background:none;border:1px solid #ef444430;
-            border-radius:5px;padding:1px 7px;cursor:pointer;flex-shrink:0;margin-left:8px;">✕</button>
-      `;
-      row.querySelector("button").addEventListener("click", () => {
-        removeFromBlacklist(id);
-        row.remove();
-        if (!body.children.length) {
-          body.innerHTML = '<p style="color:#4b5563;text-align:center;padding:24px 0;font-size:12px;">Blacklist is empty.</p>';
+      const tile = buildBlacklistCardTile(id, data, (removedId, el) => {
+        removeFromBlacklist(removedId);
+        el.remove();
+        if (!grid.children.length) {
+          body.innerHTML =
+            '<p style="color:#4b5563;text-align:center;padding:48px 0;font-size:13px;">Blacklist is empty.</p>';
         }
         if (onChangeCallback) onChangeCallback();
       });
-      body.appendChild(row);
+      grid.appendChild(tile);
     }
+
+    body.appendChild(grid);
   }
 
   function buildHistoryModal() {
@@ -1623,10 +1783,16 @@
         renderHistory();
       }
     });
-    modal.querySelector("#gcb-hist-mythic-btn").addEventListener("click", () => {
-      const mythicModal = DOMCache.get("gcb-mythic-modal");
-      if (mythicModal) { mythicModal.style.display = "flex"; mythicWindowOpen = true; renderMythicWindow(); }
-    });
+    modal
+      .querySelector("#gcb-hist-mythic-btn")
+      .addEventListener("click", () => {
+        const mythicModal = DOMCache.get("gcb-mythic-modal");
+        if (mythicModal) {
+          mythicModal.style.display = "flex";
+          mythicWindowOpen = true;
+          renderMythicWindow();
+        }
+      });
 
     makeDraggable(modal, modal.querySelector("#gcb-hist-header"));
 
@@ -1906,7 +2072,6 @@
       DOMCache.get("gcb-fab").style.display = "flex";
     });
 
-
     // ── History ──
     panel.querySelector("#gcb-hist-open").addEventListener("click", () => {
       const modal = DOMCache.get("gcb-history-modal");
@@ -1916,9 +2081,12 @@
       modal.style.display = "flex";
       historyWindowOpen = true;
       const history = renderHistory();
-      const hasMythics = history.some(p => p.cards.some(c => c.rarity === "mythic"));
+      const hasMythics = history.some((p) =>
+        p.cards.some((c) => c.rarity === "mythic"),
+      );
       const mythicBtn = modal.querySelector("#gcb-hist-mythic-btn");
-      if (mythicBtn) mythicBtn.style.display = hasMythics ? "inline-flex" : "none";
+      if (mythicBtn)
+        mythicBtn.style.display = hasMythics ? "inline-flex" : "none";
     });
 
     // ── Auto-open toggle ──
@@ -2025,17 +2193,19 @@
 
       // Fold toggle (clicking the header row expands/collapses the body)
       const adHeader = panel.querySelector("#gcb-ad-header");
-      const adBody   = panel.querySelector("#gcb-ad-body");
-      const adArrow  = panel.querySelector("#gcb-ad-arrow");
+      const adBody = panel.querySelector("#gcb-ad-body");
+      const adArrow = panel.querySelector("#gcb-ad-arrow");
       adHeader.addEventListener("click", () => {
         const open = adBody.style.display === "none";
-        adBody.style.display    = open ? "block" : "none";
+        adBody.style.display = open ? "block" : "none";
         adArrow.style.transform = open ? "rotate(90deg)" : "";
       });
       // Stop the toggle label from bubbling up to the fold header
-      panel.querySelector("#gcb-ad-toggle-label").addEventListener("click", (e) => {
-        e.stopPropagation();
-      });
+      panel
+        .querySelector("#gcb-ad-toggle-label")
+        .addEventListener("click", (e) => {
+          e.stopPropagation();
+        });
 
       // Master enable toggle
       const adEnabled = panel.querySelector("#gcb-ad-enabled");
@@ -2047,10 +2217,12 @@
 
       // Rarity mode pill — initialize text from saved config
       const adRarityModeBtn = panel.querySelector("#gcb-ad-rarity-mode");
-      adRarityModeBtn.textContent = cfg.rarityMode === "include" ? "Include" : "Exclude";
+      adRarityModeBtn.textContent =
+        cfg.rarityMode === "include" ? "Include" : "Exclude";
       adRarityModeBtn.addEventListener("click", () => {
         cfg.rarityMode = cfg.rarityMode === "include" ? "exclude" : "include";
-        adRarityModeBtn.textContent = cfg.rarityMode === "include" ? "Include" : "Exclude";
+        adRarityModeBtn.textContent =
+          cfg.rarityMode === "include" ? "Include" : "Exclude";
         saveAutoDeleteConfig(cfg);
       });
 
@@ -2061,7 +2233,7 @@
         btn.className = "gcb-rarity-btn";
         btn.textContent = r[0].toUpperCase() + r.slice(1);
         btn.style.border = `1px solid ${RARITY_COLORS[r]}40`;
-        btn.style.color  = RARITY_COLORS[r];
+        btn.style.color = RARITY_COLORS[r];
         if (cfg.rarities.has(r)) {
           btn.style.background = RARITY_COLORS[r] + "22";
           btn.style.fontWeight = "700";
@@ -2083,10 +2255,12 @@
 
       // Nationality mode pill
       const adNatModeBtn = panel.querySelector("#gcb-ad-nat-mode");
-      adNatModeBtn.textContent = cfg.natMode === "include" ? "Include" : "Exclude";
+      adNatModeBtn.textContent =
+        cfg.natMode === "include" ? "Include" : "Exclude";
       adNatModeBtn.addEventListener("click", () => {
         cfg.natMode = cfg.natMode === "include" ? "exclude" : "include";
-        adNatModeBtn.textContent = cfg.natMode === "include" ? "Include" : "Exclude";
+        adNatModeBtn.textContent =
+          cfg.natMode === "include" ? "Include" : "Exclude";
         saveAutoDeleteConfig(cfg);
       });
 
@@ -2098,7 +2272,10 @@
       // immediately triggers a pack open without clicking away first.
       adNationsEl.addEventListener("input", () => {
         cfg.nations = new Set(
-          adNationsEl.value.split(/[\n,]+/).map(s => s.trim().toLowerCase()).filter(Boolean)
+          adNationsEl.value
+            .split(/[\n,]+/)
+            .map((s) => s.trim().toLowerCase())
+            .filter(Boolean),
         );
         saveAutoDeleteConfig(cfg);
       });
@@ -2108,7 +2285,10 @@
       adWhitelistEl.value = [...cfg.whitelist].join("\n");
       adWhitelistEl.addEventListener("input", () => {
         cfg.whitelist = new Set(
-          adWhitelistEl.value.split("\n").map(s => s.trim().toLowerCase().normalize("NFC")).filter(Boolean)
+          adWhitelistEl.value
+            .split("\n")
+            .map((s) => s.trim().toLowerCase().normalize("NFC"))
+            .filter(Boolean),
         );
         saveAutoDeleteConfig(cfg);
       });
@@ -2118,9 +2298,11 @@
 
       const blEnabled = panel.querySelector("#gcb-bl-enabled");
       blEnabled.checked = blCfg.enabled;
-      panel.querySelector("#gcb-bl-toggle-label").addEventListener("click", (e) => {
-        e.stopPropagation();
-      });
+      panel
+        .querySelector("#gcb-bl-toggle-label")
+        .addEventListener("click", (e) => {
+          e.stopPropagation();
+        });
       blEnabled.addEventListener("change", () => {
         blCfg.enabled = blEnabled.checked;
         saveBlacklistConfig(blCfg);
@@ -2139,7 +2321,7 @@
         btn.className = "gcb-rarity-btn";
         btn.textContent = r[0].toUpperCase() + r.slice(1);
         btn.style.border = `1px solid ${RARITY_COLORS[r]}40`;
-        btn.style.color  = RARITY_COLORS[r];
+        btn.style.color = RARITY_COLORS[r];
         if (blCfg.rarities.has(r)) {
           btn.style.background = RARITY_COLORS[r] + "22";
           btn.style.fontWeight = "700";
@@ -2167,11 +2349,16 @@
       });
 
       panel.querySelector("#gcb-bl-clear").addEventListener("click", () => {
-        if (confirm("Clear the blacklist? Repulled cards will no longer be auto-deleted.")) {
+        if (
+          confirm(
+            "Clear the blacklist? Repulled cards will no longer be auto-deleted.",
+          )
+        ) {
           saveBlacklist({});
           refreshBlCount();
           const blModal = DOMCache.get("gcb-bl-modal");
-          if (blModal && blModal.style.display !== "none") renderBlacklistModal(refreshBlCount);
+          if (blModal && blModal.style.display !== "none")
+            renderBlacklistModal(refreshBlCount);
         }
       });
     })();
@@ -2183,10 +2370,14 @@
   }
 
   function findLoadMoreButton() {
-    for (const el of document.querySelectorAll("button")) {
+    // Scope to the collection tab so we don't accidentally match "Show next"
+    // buttons on other parts of the page (history, packs, etc.).
+    const scope =
+      document.querySelector("#tabs-content-collection") || document;
+    for (const el of scope.querySelectorAll("button")) {
       if (el.closest("#gcb-panel") || el.disabled) continue;
       const t = (el.innerText || "").trim().toLowerCase();
-      if (t.startsWith("load more")) return el;
+      if (t.startsWith("load more") || t.startsWith("show next")) return el;
     }
     return null;
   }
@@ -2229,7 +2420,7 @@
 
       if (!loadMore) {
         console.warn(
-          '[GachaBot] No "Load more" button found in collection tab after 8s. Run gachaDebug() to inspect buttons.',
+          '[GachaBot] No "Load more"/"Show next" button found in collection tab after 8s. Run gachaDebug() to inspect buttons.',
         );
       }
 
@@ -2481,12 +2672,14 @@
   }
 
   // MutationObserver — debounced so rapid DOM mutations during page load don't cascade
-  const observer = new MutationObserver(debounce(() => {
-    tryStart();
-    updatePackDisplay();
-    syncFilterSection();
-    tryScrapePack();
-  }, 300));
+  const observer = new MutationObserver(
+    debounce(() => {
+      tryStart();
+      updatePackDisplay();
+      syncFilterSection();
+      tryScrapePack();
+    }, 300),
+  );
   observer.observe(document.body, {
     childList: true,
     subtree: true,
@@ -2539,12 +2732,9 @@
       })),
     );
     console.log(
-      "running:",
-      running,
-      "| autoOpen:",
-      prefs.autoOpen,
-      "| overlay:",
-      isResultOverlayVisible(),
+      "running:", running,
+      "| autoOpen:", prefs.autoOpen,
+      "| overlay:", isResultOverlayVisible(),
     );
   };
 
@@ -2636,4 +2826,3 @@
     return text;
   };
 })();
-
