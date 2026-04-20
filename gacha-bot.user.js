@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GachaBot (Beta)
 // @namespace    http://tampermonkey.net/
-// @version      1.35-beta
+// @version      1.37-beta
 // @description  Auto-open packs + collection filter panel for gacha.miz.to
 // @author       Sp4ceCowb0y
 // @match        https://gacha.miz.to/*
@@ -13,6 +13,30 @@
 // ───────────────────────────────────────────────────────────────────
 //  CHANGELOG
 // ───────────────────────────────────────────────────────────────────
+//  v1.37 Fix: fav yellow border not visible after clicking ♥ Fav in history panel.
+//        Root cause: CSS override used stale data-gcb-fav on the wrapper, fighting
+//        React's class update. Fixed by syncing wrapper attribute immediately after
+//        native button click, and updating CSS selectors from button[class*="left-0.5"]
+//        to button[title="Favorite/Unfavorite"] (stable, title-based).
+//        Fix: site changed card URLs from /users/{id} to /view/{ownerId}/{id}-{copy}.
+//        Updated scrapeOverlayCards(), applyCollectionDeletions(), startDeletionObserver(),
+//        applyCollectionFavStates(), removeCardFromCollectionDom(), and findCollectionCard()
+//        to use the new URL format — fixes empty history panel, missing deleted-card
+//        stamps, and "Remember Deleted" blacklist not triggering.
+//        Fix: cards deleted from collection tab not added to Remember Deleted blacklist.
+//        Root cause: gcb-card-meta cache was never populated for collection cards, so
+//        lookupCardMeta returned null and addToBlacklist was skipped. Fix: added
+//        cacheCollectionCardMeta() called on every collection tab activation.
+//
+//  v1.36 Fix: replace positional class selectors (left-0.5, right-0.5) for native
+//        fav/delete buttons — those Tailwind classes were removed from the compiled
+//        stylesheet in a site update, breaking both selectors. Fav button now found
+//        via button[title="Favorite"] / button[title="Unfavorite"] (title attributes
+//        are stable across layout changes). Delete fallback selector removed; relies
+//        solely on button[title="Delete"] which remains present.
+//        Fix: isFav class check now case-insensitive (.toLowerCase()) to handle both
+//        bg-[#78350f] and bg-[#78350F] variants the site may emit.
+//
 //  v1.35 Fix: detect renamed "Show next N" pagination button (was "Load more").
 //        Fix: isShiny() now also detects the ✨ badge div added outside the <a>
 //        tag in the new site card layout.
@@ -757,10 +781,10 @@
     const cards = [];
     // Look inside the overlay container first; fall back to whole page
     const root = document.querySelector(".z-1000") || document.body;
-    const links = root.querySelectorAll('a[href*="/users/"]');
+    const links = root.querySelectorAll('a[href*="/view/"]');
     const seen = new Set();
     for (const a of links) {
-      const m = a.href.match(/users\/(\d+)/);
+      const m = a.href.match(/\/view\/\d+\/(\d+)-\d+/);
       if (!m) continue;
       const id = parseInt(m[1]);
       if (seen.has(id)) continue;
@@ -944,6 +968,31 @@
     return loadCardMeta()[playerId] || null;
   }
 
+  // Scrape all currently visible collection card wrappers and populate the card
+  // meta cache. Called on every collection tab activation so that fetch-hook
+  // interceptions of DELETE /api/collection can look up name/rarity/country for
+  // blacklisting — those fields are unavailable from the API response alone.
+  function cacheCollectionCardMeta() {
+    for (const w of getCardWrappers()) {
+      const a = w.querySelector("a[href]");
+      if (!a) continue;
+      const m = a.href.match(/\/view\/\d+\/(\d+)-\d+/);
+      if (!m) continue;
+      const id = parseInt(m[1]);
+      const nameEl = a.querySelector("p.font-bold:not(.font-mono)");
+      const rarityEl = a.querySelector(
+        'p[class*="font-semibold"][class*="uppercase"]',
+      );
+      const flagEl = a.querySelector('img[src*="flags/4x3/"]');
+      const flagM = flagEl ? flagEl.src.match(/flags\/4x3\/([a-z]+)\.svg/) : null;
+      const name = nameEl ? nameEl.textContent.trim() : "";
+      const rarity = rarityEl ? rarityEl.textContent.trim().toLowerCase() : "";
+      const country = flagM ? flagM[1] : "";
+      const avatar = `https://a.ppy.sh/${id}`;
+      if (name) cacheCardMeta({ id, name, rarity, country, avatar });
+    }
+  }
+
   function removeFromBlacklist(id) {
     const bl = loadBlacklist();
     delete bl[id];
@@ -1088,7 +1137,7 @@
     for (const w of getCardWrappers()) {
       const a = w.querySelector("a[href]");
       if (!a) continue;
-      const m = a.href.match(/\/users\/(\d+)/);
+      const m = a.href.match(/\/view\/\d+\/(\d+)-\d+/);
       if (!m) continue;
       const id = parseInt(m[1]);
       if (!deleted.has(id)) continue;
@@ -1113,7 +1162,7 @@
           if (node.nodeType !== 1) continue;
           const a = node.querySelector("a[href]");
           if (!a) continue;
-          const m = a.href.match(/\/users\/(\d+)/);
+          const m = a.href.match(/\/view\/\d+\/(\d+)-\d+/);
           if (m && deleted.has(parseInt(m[1]))) {
             node.dataset.gcbDeleted = "true";
           }
@@ -1137,7 +1186,7 @@
     for (const w of getCardWrappers()) {
       const a = w.querySelector("a[href]");
       if (!a) continue;
-      const m = a.href.match(/\/users\/(\d+)/);
+      const m = a.href.match(/\/view\/\d+\/(\d+)-\d+/);
       if (!m) continue;
       const id = parseInt(m[1]);
       const stored = states[id];
@@ -1163,7 +1212,7 @@
   // for why removing from React's managed DOM causes crashes.
   function removeCardFromCollectionDom(playerId) {
     for (const w of getCardWrappers()) {
-      if (w.querySelector(`a[href*="/users/${playerId}"]`)) {
+      if (w.querySelector(`a[href*="/${playerId}-"]`)) {
         w.dataset.gcbDeleted = "true";
       }
     }
@@ -1172,7 +1221,7 @@
   // Return the collection grid wrapper for a given player ID, or null if not loaded.
   function findCollectionCard(playerId) {
     for (const w of getCardWrappers()) {
-      if (w.querySelector(`a[href*="/users/${playerId}"]`)) return w;
+      if (w.querySelector(`a[href*="/${playerId}-"]`)) return w;
     }
     return null;
   }
@@ -1349,13 +1398,16 @@
 
       // Prefer clicking the native ❤️/🤍 button so React handles the API call and
       // updates the collection card state itself — no page reload needed.
-      // Native fav button: left-positioned, bg-[#78350f] when favourited.
+      // Native fav button: identified by title attribute (stable across layout changes).
+      // bg-[#78350f] class on the button signals the favourited state.
       const collCard = findCollectionCard(card.id);
-      const nativeBtn = collCard?.querySelector('button[class*="left-0.5"]');
+      const nativeBtn = collCard?.querySelector('button[title="Favorite"], button[title="Unfavorite"]');
       if (nativeBtn) {
         // Only click if the button's current state doesn't already match wantFav
-        const isFav = nativeBtn.className.includes("78350f");
+        const isFav = nativeBtn.className.toLowerCase().includes("78350f");
         if (isFav !== wantFav) nativeBtn.click();
+        // Sync wrapper attribute immediately so the CSS override doesn't fight React's class update
+        if (collCard) collCard.dataset.gcbFav = wantFav ? "true" : "false";
       } else {
         // Card not loaded in collection tab — fall back to direct API call
         await apiToggleFavourite(card.id);
@@ -1382,9 +1434,7 @@
       // collection state update. The native button shows an inline confirm overlay
       // ("Delete 1 copy" / "No") inside the card wrapper.
       const collCard = findCollectionCard(card.id);
-      const nativeDelBtn =
-        collCard?.querySelector('button[title="Delete"]') ||
-        collCard?.querySelector('button[class*="right-0.5"]');
+      const nativeDelBtn = collCard?.querySelector('button[title="Delete"]');
       let ok = false;
       if (nativeDelBtn) {
         nativeDelBtn.click();
@@ -1895,11 +1945,12 @@
             /* Correct fav button appearance when collection tab remounts from RSC cache.
                React controls button classes; we set data-gcb-fav on the wrapper, which
                React ignores, so these overrides survive re-renders. */
-            #tabs-content-collection .grid > .relative[data-gcb-fav="true"] button[class*="left-0.5"] {
+            #tabs-content-collection .grid > .relative[data-gcb-fav="true"] button[title="Unfavorite"],
+            #tabs-content-collection .grid > .relative[data-gcb-fav="true"] button[title="Favorite"] {
                 background-color: #78350f !important;
                 border-color: #fcd34d !important;
             }
-            #tabs-content-collection .grid > .relative[data-gcb-fav="false"] button[class*="left-0.5"] {
+            #tabs-content-collection .grid > .relative[data-gcb-fav="false"] button[title="Favorite"] {
                 background-color: #111827 !important;
                 border-color: #374151 !important;
             }
@@ -2635,6 +2686,7 @@
       if (grid) grid.style.visibility = "hidden";
       applyCollectionDeletions();
       if (grid) grid.style.visibility = "";
+      cacheCollectionCardMeta();
       applyCollectionFavStates();
       refreshCountryList();
       applyFilters();
