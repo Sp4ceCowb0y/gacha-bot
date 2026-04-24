@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         GachaBot (Beta)
+// @name         GachaBot
 // @namespace    http://tampermonkey.net/
 // @version      1.38
 // @description  Auto-open packs + collection filter panel for gacha.miz.to
