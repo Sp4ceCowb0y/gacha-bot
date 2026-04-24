@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GachaBot
 // @namespace    http://tampermonkey.net/
-// @version      1.37
+// @version      1.38
 // @description  Auto-open packs + collection filter panel for gacha.miz.to
 // @author       Sp4ceCowb0y
 // @match        https://gacha.miz.to/*
@@ -13,6 +13,50 @@
 // ───────────────────────────────────────────────────────────────────
 //  CHANGELOG
 // ───────────────────────────────────────────────────────────────────
+//  v1.38 Fix: Shiny cards in Collection Panel now replicate the original site image
+//        color effect — animated hue-rotate (8s linear) + saturate(1.5) + brightness(1.1)
+//        on the card image, gold diagonal shimmer overlay, and ✨ inline in header.
+//        Fix: Shiny card tiles now use rarity border color — removed silver #e2e8f0
+//        override and gcb-shiny-glow animation (original site has no silver border).
+//        Fix: Fav/delete event payloads now carry isShiny so filter sync correctly
+//        targets the shiny or non-shiny copy when both exist in collectionCache.
+//        Refactor: Removed native collection tab filter section (rarity/shiny/favs/
+//        country buttons, loadAllCards auto-pagination) — superseded by Collection Panel.
+//        Perf: card meta and history now cached in memory — avoids 5 localStorage
+//        read+write cycles per pack; card meta writes debounced to 200 ms.
+//        feat: Card tiles now match native site style — rarity gradient header, shiny
+//        badge moved inside image area (no longer obscures player name), parallax tilt
+//        on hover (perspective rotateX/Y + scale), persistent circular fav/delete
+//        buttons at tile bottom, flag moved inside image, follower/rank stats bar, and
+//        card link opens player profile in new tab. Fetches /api/me once at boot to
+//        derive the logged-in player ID needed for card profile URLs.
+//        feat: Collection Panel — full-screen overlay (📋 button) with rarity/shiny/
+//        favs/name/country filters and pagination-aware card grid.
+//        feat: Country filter in Collection Panel — native <select> dropdown with full
+//        hardcoded country list (matches site's own list); ✕ Clear button to reset.
+//        (Replaces chip bar that only populated after card data loaded.)
+//        feat: Shiny cards displayed as separate tiles from non-shiny copies, with
+//        animated golden border glow and shimmer sweep effect.
+//        Fix: /api/collection cursor pagination uses individual query params
+//        cursorPlayerId/cursorSortRank/cursorVariantSort from nextCursor object —
+//        offset and JSON cursor string are both silently ignored by the server.
+//        Fix: API aggregates copies per template; entry.count is the real copy count.
+//        No client-side grouping needed; use entry.count directly for ×N badge.
+//        Fix: rarity stored lowercase in collectionCache so RARITY_COLORS lookup and
+//        rarity filter buttons both match correctly.
+//        Fix: DELETE /api/collection payload changed from {playerIds:[N]} to
+//        {deleteTargets:[{playerId,isShiny,isSigned,quantity:1}]}. Updated apiDelete()
+//        to use new format; both auto-delete and history-panel fallback paths updated.
+//        Fix: POST /api/favorites requires {playerId,isShiny,isSigned,isFavorite} —
+//        old payload {playerId} returned 400. apiToggleFavourite now passes the full
+//        payload; fav/unfav in Collection Panel now persists correctly.
+//        Fix: Shiny card border/glow changed from amber (#fbbf24) to silver (#e2e8f0)
+//        so shiny cards are visually distinct from legendary cards.
+//        Fix: Fav/delete in Collection Panel tiles now syncs filter state live — unfaving
+//        a card removes it when "♥ Only" is active; deleting removes it immediately.
+//        Fix: Collection Panel loads cards progressively — tiles appear as each page of
+//        60 cards arrives instead of waiting for the full collection to load.
+//
 //  v1.37 Fix: fav yellow border not visible after clicking ♥ Fav in history panel.
 //        Root cause: CSS override used stale data-gcb-fav on the wrapper, fighting
 //        React's class update. Fixed by syncing wrapper attribute immediately after
@@ -270,6 +314,17 @@
     uncommon: "#4ade80",
     common: "#9ca3af",
   };
+  const RARITY_GRADIENTS = {
+    mythic:    "linear-gradient(rgb(127,29,29) 0%,rgb(26,5,5) 100%)",
+    legendary: "linear-gradient(rgb(120,83,0) 0%,rgb(26,18,0) 100%)",
+    epic:      "linear-gradient(rgb(76,29,149) 0%,rgb(20,5,38) 100%)",
+    rare:      "linear-gradient(rgb(29,78,216) 0%,rgb(5,15,50) 100%)",
+    uncommon:  "linear-gradient(rgb(20,83,45) 0%,rgb(5,20,12) 100%)",
+    common:    "linear-gradient(rgb(55,65,81) 0%,rgb(13,17,23) 100%)",
+  };
+
+  // Logged-in user's player ID — fetched once at boot, used for card profile links.
+  let gcbMyPlayerId = null;
 
   // ═══════════════════════════════════════════════════════════════
   //  UTILITIES
@@ -566,16 +621,6 @@
     if (findButton("Open Pack") || isResultOverlayVisible()) openAllPacks();
   }
 
-  // ═══════════════════════════════════════════════════════════════
-  //  COLLECTION FILTER — helpers
-  // ═══════════════════════════════════════════════════════════════
-  const filterState = {
-    countries: new Set(),
-    rarities: new Set(),
-    shinyOnly: false,
-    favsMode: "off", // 'off' | 'only' | 'hide'
-  };
-
   function isCollectionTabActive() {
     const t = document.querySelector("#tabs-content-collection");
     return t && t.dataset.state === "active";
@@ -585,119 +630,6 @@
     return document.querySelectorAll(
       "#tabs-content-collection .grid > .relative",
     );
-  }
-
-  // Card metadata cache — avoids repeating querySelectorAll for country/rarity/shiny on
-  // every filter pass. WeakMap keys are automatically GC'd when wrapper elements are removed.
-  let _cardMeta = new WeakMap();
-  function getCardMeta(wrapper) {
-    if (_cardMeta.has(wrapper)) return _cardMeta.get(wrapper);
-    const meta = {
-      country: getCountryCode(wrapper),
-      rarity: getRarity(wrapper),
-      shiny: isShiny(wrapper),
-    };
-    _cardMeta.set(wrapper, meta);
-    return meta;
-  }
-  function clearCardMetaCache() {
-    _cardMeta = new WeakMap();
-  }
-
-  // Coalescing idle filter scheduler — ensures at most one pending applyFilters call
-  // is queued at a time. Subsequent calls before the idle callback fires are no-ops.
-  // Use cancelIdleFilter() + applyFilters() to flush synchronously when needed.
-  let _idleFilterHandle = null;
-  function scheduleIdleFilter() {
-    if (_idleFilterHandle !== null) return;
-    _idleFilterHandle = scheduleIdle(() => {
-      _idleFilterHandle = null;
-      applyFilters();
-    });
-  }
-  function cancelIdleFilter() {
-    if (_idleFilterHandle !== null) {
-      cancelIdle(_idleFilterHandle);
-      _idleFilterHandle = null;
-    }
-  }
-
-  function getCountryCode(card) {
-    const img = card.querySelector('img[src*="flag-icons/flags/4x3/"]');
-    if (!img) return null;
-    const m = img.src.match(/flags\/4x3\/([a-z]+)\.svg/);
-    return m ? m[1] : null;
-  }
-
-  function getRarity(card) {
-    const p = card.querySelector(
-      'a > div > p[class*="font-semibold"][class*="uppercase"]',
-    );
-    return p ? p.textContent.trim().toLowerCase() : null;
-  }
-
-  function isShiny(card) {
-    // Primary: shimmer overlay with rounded-md — unique to shiny cards.
-    // Legendary shimmer uses 4s duration without rounded-md so it never matches.
-    if (card.querySelector('[class*="shimmer"][class*="rounded-md"]')) return true;
-    // Fallback: ✨ badge div added as a direct child of the card wrapper in the
-    // new site layout (outside the <a> tag, alongside the fav/delete buttons).
-    for (const el of card.querySelectorAll(":scope > div")) {
-      if (el.textContent.trim() === "✨") return true;
-    }
-    return false;
-  }
-
-  function applyFilters() {
-    const wrappers = getCardWrappers();
-    let visible = 0;
-    let total = 0;
-    for (const w of wrappers) {
-      // Cards hidden by our delete stamp are excluded from count and filtering.
-      // CSS handles their display:none via [data-gcb-deleted="true"] { display:none !important }.
-      if (w.dataset.gcbDeleted === "true") continue;
-      total++;
-      // getCardMeta caches country/rarity/shiny per wrapper — DOM queries run once per card
-      // across all filter applications, not once per card per filter apply.
-      const { country, rarity, shiny } = getCardMeta(w);
-      const countryOk = !country || filterState.countries.has(country);
-      const rarityOk =
-        filterState.rarities.size === 0 ||
-        (rarity && filterState.rarities.has(rarity));
-      const shinyOk = !filterState.shinyOnly || shiny;
-      // data-gcb-fav is stamped by applyCollectionFavStates() on tab activation.
-      // Cards added in later batches may not have been stamped yet — lazy-stamp them now.
-      if (w.dataset.gcbFav === undefined) {
-        w.dataset.gcbFav = !!w.querySelector('button[title="Unfavorite"]')
-          ? "true"
-          : "false";
-      }
-      const isFav = w.dataset.gcbFav === "true";
-      const favOk =
-        filterState.favsMode === "only"
-          ? isFav
-          : filterState.favsMode === "hide"
-            ? !isFav
-            : true;
-      const show = countryOk && rarityOk && shinyOk && favOk;
-      w.style.display = show ? "" : "none";
-      if (show) visible++;
-    }
-    if (!loadingAllCards) {
-      const el = DOMCache.get("gcb-filter-count");
-      if (el) el.textContent = `Showing ${visible} of ${total} cards`;
-    }
-  }
-
-  function collectCountries() {
-    const map = new Map();
-    for (const w of getCardWrappers()) {
-      const img = w.querySelector('img[src*="flag-icons/flags/4x3/"]');
-      if (!img) continue;
-      const m = img.src.match(/flags\/4x3\/([a-z]+)\.svg/);
-      if (m) map.set(m[1], img.src);
-    }
-    return map;
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -720,13 +652,16 @@
       .join(",");
   }
 
+  let _historyCache = null;
   function loadHistory() {
-    return StorageUtils.getJSON("gcb-history", []);
+    if (_historyCache !== null) return _historyCache;
+    _historyCache = StorageUtils.getJSON("gcb-history", []);
+    return _historyCache;
   }
-
   function saveHistory(history) {
     if (history.length > MAX_HISTORY_PACKS)
       history = history.slice(-MAX_HISTORY_PACKS);
+    _historyCache = history;
     StorageUtils.setJSON("gcb-history", history);
   }
 
@@ -816,14 +751,23 @@
     return cards;
   }
 
-  // POST /api/favorites is a toggle — returns { isFavorite: bool }.
-  // Call it once to fav, call it again to unfav.
-  async function apiToggleFavourite(playerId) {
+  async function fetchMyPlayerId() {
+    try {
+      const res = await fetch("/api/me", { credentials: "include" });
+      if (!res.ok) return;
+      const data = await res.json();
+      gcbMyPlayerId = data?.user?.id ? String(data.user.id) : null;
+    } catch {}
+  }
+
+  // POST /api/favorites — sets favourite state explicitly via { playerId, isShiny, isSigned, isFavorite }.
+  // isFavorite is the desired target state (true = fav, false = unfav). Returns { isFavorite: bool }.
+  async function apiToggleFavourite(playerId, isShiny = false, isSigned = false, isFavorite = true) {
     try {
       const res = await fetch("/api/favorites", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ playerId }),
+        body: JSON.stringify({ playerId, isShiny, isSigned, isFavorite }),
       });
       const text = await res.text().catch(() => "");
       console.log(`[GachaBot] apiToggleFavourite ${res.status}:`, text);
@@ -839,12 +783,12 @@
     }
   }
 
-  async function apiDelete(playerId) {
+  async function apiDelete(playerId, isShiny = false, isSigned = false) {
     try {
       const res = await fetch("/api/collection", {
         method: "DELETE",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ playerIds: [playerId] }),
+        body: JSON.stringify({ deleteTargets: [{ playerId, isShiny, isSigned, quantity: 1 }] }),
       });
       const text = await res.text().catch(() => "");
       console.log(`[GachaBot] apiDelete ${res.status}:`, text);
@@ -950,8 +894,12 @@
   // Persists { name, rarity, country, avatar } keyed by player ID so the fetch
   // hook can look up card details when a native deletion is intercepted.
   const CARD_META_KEY = "gcb-card-meta";
+  let _cardMetaCache = null;
+  let _cardMetaFlushTimer = null;
   function loadCardMeta() {
-    return StorageUtils.getJSON(CARD_META_KEY);
+    if (_cardMetaCache !== null) return _cardMetaCache;
+    _cardMetaCache = StorageUtils.getJSON(CARD_META_KEY);
+    return _cardMetaCache;
   }
   function cacheCardMeta(card) {
     if (!card.id || !card.name) return;
@@ -962,7 +910,8 @@
       country: card.country,
       avatar: card.avatar || "",
     };
-    StorageUtils.setJSON(CARD_META_KEY, meta);
+    clearTimeout(_cardMetaFlushTimer);
+    _cardMetaFlushTimer = setTimeout(() => StorageUtils.setJSON(CARD_META_KEY, _cardMetaCache), 200);
   }
   function lookupCardMeta(playerId) {
     return loadCardMeta()[playerId] || null;
@@ -1075,7 +1024,7 @@
     if (!cfg.enabled) return;
     for (const card of cards) {
       if (!shouldAutoDelete(card, cfg) && !isBlacklisted(card.id)) continue;
-      const ok = await apiDelete(card.id);
+      const ok = await apiDelete(card.id, card.isShiny, card.isSigned);
       if (ok) {
         markCollectionDeleted(card.id);
         if (packTs) saveDeletedInstance(packTs, card.id);
@@ -1290,63 +1239,121 @@
     return false;
   }
 
-  function buildCardTile(card, packTs) {
-    cacheCardMeta(card);
+  function buildCardTile(card, packTs, _preloadedStates) {
+    if (!_preloadedStates) cacheCardMeta(card);
     const rarityColor = RARITY_COLORS[card.rarity] || "#9ca3af";
-    // fav is shared per player ID; deleted is per pack-card instance so the same
-    // player in a different pack is not affected.
+    const rarityGrad = RARITY_GRADIENTS[card.rarity] || RARITY_GRADIENTS.common;
+    const isShiny = card.shiny || card.isShiny || false;
+    const borderColor = rarityColor;
+    const states = _preloadedStates || loadCardStates();
     const state = {
-      fav: loadCardStates()[card.id]?.fav || false,
-      deleted: packTs
-        ? !!loadDeletedInstances()[`${packTs}_${card.id}`]
-        : false,
+      fav: card.isFavorited ?? states[card.id]?.fav ?? false,
+      deleted: packTs ? !!loadDeletedInstances()[`${packTs}_${card.id}`] : false,
     };
 
+    // Outer tile — overflow:visible so count badge can bleed outside
     const tile = document.createElement("div");
     tile.dataset.playerId = card.id;
     tile.style.cssText = `
-      position:relative; width:160px; background:#0d1525;
-      border:${state.fav ? "2px solid #ef4444" : "2px solid " + rarityColor}; border-radius:8px;
-      overflow:hidden; transition:border-color 0.15s;
+      position:relative; width:160px; flex-shrink:0;
+      padding-bottom:14px;
+      transition:transform 0.45s cubic-bezier(0.23,1,0.32,1);
     `;
+
+    // Parallax tilt on mousemove
+    tile.addEventListener("mousemove", (e) => {
+      if (state.deleted) return;
+      const r = tile.getBoundingClientRect();
+      const dx = ((e.clientX - r.left) / r.width - 0.5) * 2;
+      const dy = ((e.clientY - r.top) / r.height - 0.5) * 2;
+      tile.style.transform = `perspective(900px) rotateX(${-dy * 8}deg) rotateY(${dx * 8}deg) scale(1.04)`;
+    });
+    tile.addEventListener("mouseleave", () => { tile.style.transform = ""; });
+
+    // Card link — wraps the visual card; navigates to player profile
+    const cardLink = document.createElement("a");
+    const profilePath = gcbMyPlayerId ? `/view/${gcbMyPlayerId}/${card.id}-0` : null;
+    if (profilePath) {
+      cardLink.href = profilePath;
+      cardLink.target = "_blank";
+      cardLink.rel = "noopener noreferrer";
+    }
+    cardLink.style.cssText = `
+      display:flex; flex-direction:column; position:relative;
+      border:2px solid ${borderColor}; border-radius:8px; overflow:hidden;
+      box-shadow:0 0 6px ${borderColor}44;
+      text-decoration:none; color:inherit;
+    `;
+
+    // Header: rarity gradient background, player name, rarity label
+    const header = document.createElement("div");
+    header.style.cssText = `padding:6px 8px 4px; background:${rarityGrad};`;
+    const safeName = card.name.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+    header.innerHTML = `
+      <div style="display:flex;align-items:center;gap:4px;">
+        <div style="font-size:12px;color:#f9fafb;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-shadow:0 1px 4px ${rarityColor}88;min-width:0;" title="${safeName}">${safeName}</div>
+        ${isShiny ? '<span style="font-size:9px;color:#fcd34d;font-weight:700;flex-shrink:0;">✨</span>' : ""}
+      </div>
+      <div style="font-size:9px;color:${rarityColor};font-weight:600;letter-spacing:1.5px;text-transform:uppercase;opacity:0.9;">${card.rarity || "—"}</div>
+    `;
+
+    // Image section
+    const imgSection = document.createElement("div");
+    imgSection.style.cssText = "position:relative; flex:1;";
 
     const img = document.createElement("img");
     img.src = card.avatar;
     img.alt = card.name;
     img.loading = "lazy";
-    img.style.cssText =
-      "width:100%;aspect-ratio:1;object-fit:cover;display:block;";
-    img.onerror = () => {
-      img.style.background = "#1f2937";
-      img.src = "";
-    };
+    img.style.cssText = `width:100%;aspect-ratio:1;object-fit:cover;display:block;${isShiny ? "animation:gcb-hue-cycle 8s linear infinite;" : ""}`;
+    img.onerror = () => { img.style.background = "#1f2937"; img.src = ""; };
 
-    const info = document.createElement("div");
-    info.style.cssText = "padding:6px 6px 7px;text-align:center;";
-    const flagHtml = card.country
-      ? `<img src="https://cdn.jsdelivr.net/gh/lipis/flag-icons/flags/4x3/${card.country}.svg"
-              loading="lazy"
-              style="height:10px;vertical-align:middle;margin-right:3px;border-radius:1px;"
-              onerror="this.style.display='none'">`
-      : "";
-    info.innerHTML = `
-      <div style="font-size:10px;color:${rarityColor};text-transform:uppercase;letter-spacing:1.5px;
-           white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${card.rarity || "—"}</div>
-      <div style="font-size:12px;color:#f9fafb;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600;"
-           title="${card.name}">${flagHtml}${card.name}</div>
-      ${card.shiny ? '<div style="font-size:11px;line-height:1.4;">✨</div>' : ""}
-    `;
+    // Bottom gradient vignette inside image
+    const imgVignette = document.createElement("div");
+    imgVignette.style.cssText = "position:absolute;bottom:0;left:0;right:0;height:40%;background:linear-gradient(transparent,rgba(0,0,0,0.55));pointer-events:none;";
 
-    // Heart badge — shown when favourited
-    const heart = document.createElement("div");
-    heart.textContent = "♥";
-    heart.style.cssText = `
-      display:${state.fav ? "block" : "none"}; position:absolute; top:4px; right:5px;
-      font-size:28px; color:#ef4444; line-height:1;
-      text-shadow:0 0 10px #ef444499; pointer-events:none;
-    `;
+    imgSection.appendChild(img);
+    imgSection.appendChild(imgVignette);
 
-    // Deleted label — full-width banner across the card
+    // Flag — bottom-right inside image
+    if (card.country) {
+      const flag = document.createElement("img");
+      flag.src = `https://cdn.jsdelivr.net/gh/lipis/flag-icons/flags/4x3/${card.country}.svg`;
+      flag.loading = "lazy";
+      flag.style.cssText = "position:absolute;bottom:4px;right:4px;height:12px;border-radius:2px;z-index:2;pointer-events:none;";
+      flag.onerror = () => { flag.style.display = "none"; };
+      imgSection.appendChild(flag);
+    }
+
+    // Shiny overlay — diagonal gold shimmer matching the original site's shiny effect
+    if (isShiny) {
+      const shimmerOverlay = document.createElement("div");
+      shimmerOverlay.style.cssText = `
+        position:absolute;inset:0;pointer-events:none;z-index:2;
+        background:linear-gradient(135deg,transparent 0%,rgba(252,211,77,0.2) 30%,transparent 50%,rgba(252,211,77,0.2) 70%,transparent 100%);
+        background-size:200% 200%;
+        animation:gcb-shiny-shimmer 3s ease-in-out infinite;
+      `;
+      imgSection.appendChild(shimmerOverlay);
+    }
+
+    // Stats bar — followers / rank (only when the API provided them)
+    let statsBar = null;
+    if (card.followerCount !== undefined) {
+      const fmt = (n) => n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
+      statsBar = document.createElement("div");
+      statsBar.style.cssText = `
+        display:flex; justify-content:space-between; align-items:center;
+        padding:3px 6px; background:#0d1525;
+        font-size:9px; font-family:monospace; color:#6b7280;
+      `;
+      statsBar.innerHTML = `
+        <span>FLWR <span style="color:#d1d5db;">${fmt(card.followerCount)}</span></span>
+        <span>RANK <span style="color:#d1d5db;">#${fmt(card.followerRank ?? 0)}</span></span>
+      `;
+    }
+
+    // Deleted label — absolute within cardLink
     const deletedLabel = document.createElement("div");
     deletedLabel.textContent = "DELETED";
     deletedLabel.style.cssText = `
@@ -1355,84 +1362,96 @@
       align-items:center; justify-content:center;
       padding:6px 0; background:rgba(0,0,0,0.72);
       font-size:15px; font-weight:900; letter-spacing:4px; color:#ffffff;
-      text-shadow:0 1px 4px #000; pointer-events:none;
+      text-shadow:0 1px 4px #000; pointer-events:none; z-index:7;
     `;
 
-    const overlay = document.createElement("div");
-    overlay.style.cssText = `
-      display:none; position:absolute; inset:0;
-      background:rgba(0,0,0,0.78); flex-direction:column;
-      align-items:center; justify-content:center; gap:8px;
-    `;
+    // Count badge — blue circle, bleeds outside top-right corner of tile
+    if (card.count > 1) {
+      const badge = document.createElement("div");
+      badge.textContent = card.count;
+      badge.style.cssText = `
+        position:absolute; top:-6px; right:-6px;
+        background:#1D4ED8; border:1px solid #3B82F6;
+        color:#fff; font-size:10px; font-weight:700;
+        width:22px; height:22px; border-radius:50%;
+        display:flex; align-items:center; justify-content:center;
+        z-index:6; line-height:1;
+      `;
+      tile.appendChild(badge);
+    }
 
+    // Persistent fav button — circular, bottom-left of tile
     const favBtn = document.createElement("button");
-    favBtn.textContent = state.fav ? "♥ Unfav" : "♥ Fav";
-    favBtn.style.cssText = `font-size:11px;padding:5px 14px;border-radius:20px;cursor:pointer;
-      background:${state.fav ? "#ef444433" : "#ef444422"};border:1px solid #ef444480;color:#ef4444;`;
+    favBtn.textContent = state.fav ? "♥" : "♡";
+    favBtn.title = state.fav ? "Unfav" : "Fav";
+    favBtn.style.cssText = `
+      position:absolute; bottom:0; left:2px;
+      width:26px; height:26px; border-radius:50%; cursor:pointer;
+      border:1px solid ${state.fav ? "#fcd34d" : "#4b5563"};
+      background:${state.fav ? "#78350f" : "#1f2937"};
+      color:${state.fav ? "#fcd34d" : "#9ca3af"};
+      font-size:13px; display:flex; align-items:center; justify-content:center;
+      z-index:5; padding:0; line-height:1;
+      transition:background 0.15s, border-color 0.15s, color 0.15s;
+    `;
 
+    // Persistent del button — circular, bottom-right of tile
     const delBtn = document.createElement("button");
-    delBtn.textContent = "✕ Del";
-    delBtn.style.cssText = `font-size:11px;padding:5px 14px;border-radius:20px;cursor:pointer;
-      background:#37415122;border:1px solid #37415180;color:#9ca3af;`;
+    delBtn.textContent = "✕";
+    delBtn.title = "Delete";
+    delBtn.style.cssText = `
+      position:absolute; bottom:0; right:2px;
+      width:26px; height:26px; border-radius:50%; cursor:pointer;
+      border:1px solid #374151; background:#1f2937; color:#6b7280;
+      font-size:11px; display:flex; align-items:center; justify-content:center;
+      z-index:5; padding:0; line-height:1;
+      transition:background 0.15s, border-color 0.15s, color 0.15s;
+    `;
 
-    overlay.appendChild(favBtn);
-    overlay.appendChild(delBtn);
-    tile.appendChild(img);
-    tile.appendChild(info);
-    tile.appendChild(heart);
-    tile.appendChild(deletedLabel);
-    tile.appendChild(overlay);
+    // Assemble
+    cardLink.appendChild(header);
+    cardLink.appendChild(imgSection);
+    if (statsBar) cardLink.appendChild(statsBar);
+    cardLink.appendChild(deletedLabel);
 
-    tile.addEventListener("mouseenter", () => {
-      if (!state.deleted) overlay.style.display = "flex";
-    });
-    tile.addEventListener("mouseleave", () => {
-      overlay.style.display = "none";
-    });
+    tile.appendChild(cardLink);
+    tile.appendChild(favBtn);
+    tile.appendChild(delBtn);
 
     favBtn.addEventListener("click", async (e) => {
       e.stopPropagation();
-      favBtn.textContent = "...";
+      e.preventDefault();
+      favBtn.textContent = "…";
       favBtn.disabled = true;
       const wantFav = !state.fav;
 
-      // Prefer clicking the native ❤️/🤍 button so React handles the API call and
-      // updates the collection card state itself — no page reload needed.
-      // Native fav button: identified by title attribute (stable across layout changes).
-      // bg-[#78350f] class on the button signals the favourited state.
       const collCard = findCollectionCard(card.id);
       const nativeBtn = collCard?.querySelector('button[title="Favorite"], button[title="Unfavorite"]');
       if (nativeBtn) {
-        // Only click if the button's current state doesn't already match wantFav
         const isFav = nativeBtn.className.toLowerCase().includes("78350f");
         if (isFav !== wantFav) nativeBtn.click();
-        // Sync wrapper attribute immediately so the CSS override doesn't fight React's class update
         if (collCard) collCard.dataset.gcbFav = wantFav ? "true" : "false";
       } else {
-        // Card not loaded in collection tab — fall back to direct API call
-        await apiToggleFavourite(card.id);
+        await apiToggleFavourite(card.id, card.isShiny || false, card.isSigned || false, wantFav);
       }
 
-      // Update history tile optimistically (toggle is deterministic)
       state.fav = wantFav;
       saveCardState(card.id, { fav: wantFav });
-      heart.style.display = wantFav ? "block" : "none";
-      tile.style.border = wantFav
-        ? "2px solid #ef4444"
-        : "2px solid " + rarityColor;
-      favBtn.textContent = wantFav ? "♥ Unfav" : "♥ Fav";
-      favBtn.style.background = wantFav ? "#ef444433" : "#ef444422";
+      favBtn.textContent = wantFav ? "♥" : "♡";
+      favBtn.title = wantFav ? "Unfav" : "Fav";
+      favBtn.style.borderColor = wantFav ? "#fcd34d" : "#4b5563";
+      favBtn.style.background = wantFav ? "#78350f" : "#1f2937";
+      favBtn.style.color = wantFav ? "#fcd34d" : "#9ca3af";
       favBtn.disabled = false;
+      document.dispatchEvent(new CustomEvent("gcb:favchange", { detail: { cardId: card.id, isShiny: !!(card.isShiny || card.shiny), isFavorited: wantFav } }));
     });
 
     delBtn.addEventListener("click", async (e) => {
       e.stopPropagation();
-      delBtn.textContent = "...";
+      e.preventDefault();
+      delBtn.textContent = "…";
       delBtn.disabled = true;
 
-      // Prefer clicking the native 🗑 button so React handles the API call and
-      // collection state update. The native button shows an inline confirm overlay
-      // ("Delete 1 copy" / "No") inside the card wrapper.
       const collCard = findCollectionCard(card.id);
       const nativeDelBtn = collCard?.querySelector('button[title="Delete"]');
       let ok = false;
@@ -1440,14 +1459,12 @@
         nativeDelBtn.click();
         ok = await clickDeleteConfirm(collCard);
         if (!ok) {
-          // Dialog didn't appear or user path failed — abort without changing state
-          delBtn.textContent = "✕ Del";
+          delBtn.textContent = "✕";
           delBtn.disabled = false;
           return;
         }
       } else {
-        // Card not loaded in collection tab — fall back to direct API call
-        ok = await apiDelete(card.id);
+        ok = await apiDelete(card.id, card.isShiny, card.isSigned);
       }
 
       if (ok) {
@@ -1455,11 +1472,11 @@
         if (packTs) saveDeletedInstance(packTs, card.id);
         markCollectionDeleted(card.id);
         addToBlacklist(card);
-        overlay.style.display = "none";
         deletedLabel.style.display = "flex";
         removeCardFromCollectionDom(card.id);
+        document.dispatchEvent(new CustomEvent("gcb:carddeleted", { detail: { cardId: card.id, isShiny: !!(card.isShiny || card.shiny) } }));
       } else {
-        delBtn.textContent = "✕ Err";
+        delBtn.textContent = "✕";
         delBtn.disabled = false;
       }
     });
@@ -1942,6 +1959,15 @@
             }
             .gcb-mythic-badge:hover { background:#991b1b; }
 
+            @keyframes gcb-shiny-shimmer {
+                0%,100% { background-position: 0% 0%; }
+                50%      { background-position: 100% 100%; }
+            }
+            @keyframes gcb-hue-cycle {
+                0%   { filter: hue-rotate(0deg)   saturate(1.5) brightness(1.1); }
+                100% { filter: hue-rotate(360deg) saturate(1.5) brightness(1.1); }
+            }
+
             /* Correct fav button appearance when collection tab remounts from RSC cache.
                React controls button classes; we set data-gcb-fav on the wrapper, which
                React ignores, so these overrides survive re-renders. */
@@ -1993,6 +2019,7 @@
             ">
                 <span style="font-weight:800;font-size:12px;letter-spacing:3px;color:#3b82f6;text-transform:uppercase;">osu<span style="color:#f9fafb">!</span>gacha</span>
                 <div style="display:flex;align-items:center;gap:8px;">
+                    <button id="gcb-coll-open" style="background:none;border:none;color:#4b5563;cursor:pointer;font-size:14px;line-height:1;padding:0;" title="Collection">📋</button>
                     <button id="gcb-hist-open" style="background:none;border:none;color:#4b5563;cursor:pointer;font-size:14px;line-height:1;padding:0;" title="Pack History">🕓</button>
                     <button id="gcb-close" style="background:none;border:none;color:#4b5563;cursor:pointer;font-size:15px;line-height:1;padding:0;" title="Close">✕</button>
                 </div>
@@ -2029,36 +2056,6 @@
                             display:flex;align-items:center;justify-content:center;padding:0;">+</button>
                         <span style="font-size:11px;color:#6b7280;margin-left:5px;">packs</span>
                     </div>
-                </div>
-
-                <!-- Collection Filter section (shown only on collection tab) -->
-                <div id="gcb-filter-section" class="gcb-section" style="display:none;">
-                    <p id="gcb-filter-count" style="font-size:11px;color:#4b5563;margin-bottom:8px;"></p>
-
-                    <!-- Rarity -->
-                    <p class="gcb-label" style="margin-top:0;">Rarity</p>
-                    <div id="gcb-rarities" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:10px;"></div>
-
-                    <!-- Shiny -->
-                    <label style="display:flex;align-items:center;gap:6px;cursor:pointer;color:#fcd34d;font-size:12px;margin-bottom:6px;">
-                        <input type="checkbox" id="gcb-shiny" style="cursor:pointer;">
-                        ✨ Shiny only
-                    </label>
-
-                    <!-- Favourites -->
-                    <button id="gcb-favs" style="display:flex;align-items:center;gap:6px;cursor:pointer;background:transparent;border:1px solid #555;border-radius:6px;padding:3px 8px;font-size:12px;color:#aaa;margin-bottom:10px;width:100%;text-align:left;">
-                        ♥ Favourites: off
-                    </button>
-
-                    <!-- Countries -->
-                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
-                        <p class="gcb-label" style="margin:0;">Country</p>
-                        <div style="display:flex;gap:8px;">
-                            <button id="gcb-c-all" style="font-size:10px;color:#3b82f6;background:none;border:none;cursor:pointer;padding:0;">All</button>
-                            <button id="gcb-c-none" style="font-size:10px;color:#6b7280;background:none;border:none;cursor:pointer;padding:0;">None</button>
-                        </div>
-                    </div>
-                    <div id="gcb-countries" style="display:flex;flex-direction:column;gap:2px;max-height:260px;overflow-y:auto;"></div>
                 </div>
 
                 <!-- Auto-Delete section -->
@@ -2123,6 +2120,11 @@
       DOMCache.get("gcb-fab").style.display = "flex";
     });
 
+    // ── Collection ──
+    panel.querySelector("#gcb-coll-open").addEventListener("click", () => {
+      document.getElementById("gcb-coll-panel")?._open();
+    });
+
     // ── History ──
     panel.querySelector("#gcb-hist-open").addEventListener("click", () => {
       const modal = DOMCache.get("gcb-history-modal");
@@ -2166,76 +2168,6 @@
       const v = Math.min(10, prefs.minPacks + 1);
       prefs.minPacks = v;
       minVal.textContent = v;
-    });
-
-    // ── Rarity buttons ──
-    const rarityContainer = panel.querySelector("#gcb-rarities");
-    for (const r of RARITIES) {
-      const btn = document.createElement("button");
-      btn.className = "gcb-rarity-btn";
-      btn.dataset.rarity = r;
-      btn.textContent = r[0].toUpperCase() + r.slice(1);
-      btn.style.border = `1px solid ${RARITY_COLORS[r]}40`;
-      btn.style.color = RARITY_COLORS[r];
-      btn.addEventListener("click", () => {
-        if (filterState.rarities.has(r)) {
-          filterState.rarities.delete(r);
-          btn.style.background = "transparent";
-          btn.style.fontWeight = "400";
-        } else {
-          filterState.rarities.add(r);
-          btn.style.background = RARITY_COLORS[r] + "22";
-          btn.style.fontWeight = "700";
-        }
-        applyFilters();
-      });
-      rarityContainer.appendChild(btn);
-    }
-
-    // ── Shiny ──
-    panel.querySelector("#gcb-shiny").addEventListener("change", (e) => {
-      filterState.shinyOnly = e.target.checked;
-      applyFilters();
-    });
-
-    // ── Favourites cycle: off → only → hide → off ──
-    panel.querySelector("#gcb-favs").addEventListener("click", () => {
-      const btn = panel.querySelector("#gcb-favs");
-      if (filterState.favsMode === "off") {
-        filterState.favsMode = "only";
-        btn.textContent = "♥ Favourites: show only";
-        btn.style.color = "#ef4444";
-        btn.style.borderColor = "#ef4444";
-      } else if (filterState.favsMode === "only") {
-        filterState.favsMode = "hide";
-        btn.textContent = "♥ Favourites: hide";
-        btn.style.color = "#888";
-        btn.style.borderColor = "#888";
-      } else {
-        filterState.favsMode = "off";
-        btn.textContent = "♥ Favourites: off";
-        btn.style.color = "#aaa";
-        btn.style.borderColor = "#555";
-      }
-      applyFilters();
-    });
-
-    // ── Country All / None ──
-    // "All" = select every country, show everything
-    panel.querySelector("#gcb-c-all").addEventListener("click", () => {
-      collectCountries().forEach((_, code) => filterState.countries.add(code));
-      panel
-        .querySelectorAll("#gcb-countries input")
-        .forEach((cb) => (cb.checked = true));
-      applyFilters();
-    });
-    // "None" = no country selected → hide all flagged cards
-    panel.querySelector("#gcb-c-none").addEventListener("click", () => {
-      filterState.countries.clear();
-      panel
-        .querySelectorAll("#gcb-countries input")
-        .forEach((cb) => (cb.checked = false));
-      applyFilters();
     });
 
     // ── Auto-Delete section ──
@@ -2420,94 +2352,6 @@
     return panel;
   }
 
-  function findLoadMoreButton() {
-    // Scope to the collection tab so we don't accidentally match "Show next"
-    // buttons on other parts of the page (history, packs, etc.).
-    const scope =
-      document.querySelector("#tabs-content-collection") || document;
-    for (const el of scope.querySelectorAll("button")) {
-      if (el.closest("#gcb-panel") || el.disabled) continue;
-      const t = (el.innerText || "").trim().toLowerCase();
-      if (t.startsWith("load more") || t.startsWith("show next")) return el;
-    }
-    return null;
-  }
-
-  let loadingAllCards = false;
-
-  function setFilterStatus(msg, color = "#4b5563") {
-    const el = DOMCache.get("gcb-filter-count");
-    if (el) {
-      el.textContent = msg;
-      el.style.color = color;
-    }
-  }
-
-  async function loadAllCards() {
-    if (loadingAllCards) return;
-    loadingAllCards = true;
-    // Clear per-card caches so a fresh load doesn't serve stale DOM-extracted metadata.
-    clearCardMetaCache();
-    _lastCountryCardCount = 0;
-    setFilterStatus("Waiting for cards...", "#60a5fa");
-    try {
-      // Wait up to 8s for the first "Load more" button to appear (cards may still be rendering)
-      let loadMore = null;
-      const waitDeadline = Date.now() + 8000;
-      while (!loadMore && Date.now() < waitDeadline) {
-        loadMore = findLoadMoreButton();
-        if (!loadMore) await sleep(300);
-      }
-
-      // Inject opacity override early so each batch of cards becomes visible as it loads,
-      // not all at once at the end. !important beats React's inline style="opacity:0".
-      if (!DOMCache.get("gcb-card-visible")) {
-        const s = document.createElement("style");
-        s.id = "gcb-card-visible";
-        s.textContent =
-          "#tabs-content-collection .grid > .relative { opacity: 1 !important; transform: none !important; }";
-        document.head.appendChild(s);
-      }
-
-      if (!loadMore) {
-        console.warn(
-          '[GachaBot] No "Load more"/"Show next" button found in collection tab after 8s. Run gachaDebug() to inspect buttons.',
-        );
-      }
-
-      const grid = document.querySelector("#tabs-content-collection .grid");
-
-      while (loadMore) {
-        const before = getCardWrappers().length;
-        const remaining = loadMore.innerText.match(/\d+/);
-        const total = remaining ? before + parseInt(remaining[0]) : "?";
-        setFilterStatus(`Loading… ${before} / ${total}`, "#60a5fa");
-        loadMore.click();
-
-        // Wait for new cards using MutationObserver — zero CPU between DOM events.
-        await waitForNewCards(grid, before, 5000);
-
-        if (getCardWrappers().length === before) break;
-        // Yield to the browser so React can finish reconciling and the user can interact.
-        await waitForIdle(150);
-        // Deletions must be stamped synchronously — CSS and applyFilters both depend on the attribute.
-        applyCollectionDeletions();
-        // Country scan is fast (new wrappers only) — keep it synchronous so _lastCountryCardCount stays consistent.
-        refreshCountryList(true);
-        // Style mutations (display:none) are deferred to idle time — coalesced so only one pending call at a time.
-        scheduleIdleFilter();
-        loadMore = findLoadMoreButton();
-      }
-    } finally {
-      loadingAllCards = false;
-      // Cancel any pending idle filter and run a final synchronous pass for accurate end state.
-      cancelIdleFilter();
-      refreshCountryList();
-      applyCollectionDeletions();
-      applyFilters();
-    }
-  }
-
   function makeDraggable(el, handle) {
     let ox = 0,
       oy = 0;
@@ -2586,75 +2430,393 @@
     }
   }
 
-  // Tracks how many wrappers have already been scanned for country codes.
-  // Incremental mode skips already-scanned cards — O(newCards) instead of O(allCards) per batch.
-  let _lastCountryCardCount = 0;
+  // ═══════════════════════════════════════════════════════════════
+  //  COLLECTION PANEL
+  // ═══════════════════════════════════════════════════════════════
 
-  // incrementalOnly=true: only scan cards added since last call (used during batch loading).
-  // incrementalOnly=false (default): full scan, used on tab activation and load completion.
-  function refreshCountryList(incrementalOnly = false) {
-    const container = DOMCache.get("gcb-countries");
-    if (!container) return;
+  function normalizeApiCard(c) {
+    return {
+      ...c,
+      name: c.name || c.username || "",
+      avatar: `https://a.ppy.sh/${c.id}`,
+      country: (c.countryCode || c.nationality || "").toLowerCase(),
+      rarity: (c.rarity || "").toLowerCase(),
+      shiny: c.isShiny,
+    };
+  }
 
-    let countryMap;
-    if (incrementalOnly) {
-      const wrappers = [...getCardWrappers()];
-      const newWrappers = wrappers.slice(_lastCountryCardCount);
-      _lastCountryCardCount = wrappers.length;
-      if (!newWrappers.length) return;
-      countryMap = new Map();
-      for (const w of newWrappers) {
-        const img = w.querySelector('img[src*="flag-icons/flags/4x3/"]');
-        if (!img) continue;
-        const m = img.src.match(/flags\/4x3\/([a-z]+)\.svg/);
-        if (m) countryMap.set(m[1], img.src);
+  function syncFavStatesFromApi(cards) {
+    _cardStatesCache = null;
+    const states = loadCardStates();
+    for (const c of cards) {
+      if (!states[c.id]) states[c.id] = {};
+      states[c.id].fav = c.isFavorited;
+    }
+    StorageUtils.setJSON("gcb-card-states", states);
+    _cardStatesCache = states;
+  }
+
+  async function fetchCollection(onProgress, onPage) {
+    const cardMap = new Map();
+    const meta = loadCardMeta();
+    let favSet = null;
+    let totalMatching = 0;
+    let cursor = null;
+    do {
+      if (cardMap.size > 0) await new Promise((r) => setTimeout(r, 300));
+      let url = "/api/collection?limit=60";
+      if (cursor) {
+        url += `&cursorPlayerId=${cursor.playerId}&cursorSortRank=${cursor.sortRank}&cursorVariantSort=${cursor.variantSort}`;
       }
-    } else {
-      _lastCountryCardCount = getCardWrappers().length;
-      countryMap = collectCountries();
-    }
+      const res = await fetch(url, { credentials: "include" });
+      if (!res.ok) throw new Error(`/api/collection ${res.status}`);
+      const data = await res.json();
+      if (!favSet) {
+        favSet = new Set(data.favorites || []);
+        totalMatching = data.totalMatching || 0;
+      }
+      const entries = data.entries || [];
+      if (entries.length === 0) break;
+      const newCards = [];
+      for (const entry of entries) {
+        const c = entry.card;
+        const rarity = (c.rarity || "").toLowerCase();
+        const isFavorited = favSet.has(c.instanceId.replace("collection:", ""));
+        const norm = normalizeApiCard({ ...c, name: c.username });
+        meta[c.id] = { name: c.username, rarity, country: norm.country, avatar: norm.avatar };
+        const mapKey = `${c.id}_${c.isShiny ? 1 : 0}`;
+        if (cardMap.has(mapKey)) {
+          cardMap.get(mapKey).count += entry.count || 1;
+        } else {
+          const cardObj = { ...c, name: c.username, rarity, isFavorited, count: entry.count || 1 };
+          cardMap.set(mapKey, cardObj);
+          newCards.push(cardObj);
+        }
+      }
+      if (onProgress) onProgress(cardMap.size, totalMatching);
+      if (onPage) onPage(newCards, totalMatching);
+      cursor = data.nextCursor || null;
+      if (!cursor) break;
+    } while (true);
+    clearTimeout(_cardMetaFlushTimer);
+    _cardMetaCache = meta;
+    StorageUtils.setJSON(CARD_META_KEY, meta);
+    return { cards: [...cardMap.values()], totalMatching };
+  }
 
-    for (const [code, src] of countryMap) {
-      if (container.querySelector(`[data-code="${code}"]`)) continue;
+  let collectionCache = null;
 
-      const row = document.createElement("label");
-      row.className = "gcb-country-row";
-      row.dataset.code = code;
+  function buildCollectionPanel() {
+    let cpFilter = {
+      rarities: new Set(),
+      shinyOnly: false,
+      favsMode: "off",
+      query: "",
+      country: "",
+    };
 
-      const cb = document.createElement("input");
-      cb.type = "checkbox";
-      cb.style.cursor = "pointer";
-      cb.checked = true;
-      filterState.countries.add(code);
-      cb.addEventListener("change", () => {
-        if (cb.checked) filterState.countries.add(code);
-        else filterState.countries.delete(code);
-        applyFilters();
+    const overlay = document.createElement("div");
+    overlay.id = "gcb-coll-panel";
+    overlay.style.cssText = `
+      position:fixed; inset:0; z-index:30000;
+      background:#080f1e; display:none;
+      flex-direction:column; overflow:hidden;
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    `;
+
+    const header = document.createElement("div");
+    header.style.cssText = `
+      flex-shrink:0; display:flex; align-items:center; gap:12px;
+      padding:12px 18px; background:#0d1525;
+      border-bottom:1px solid #1f2937;
+    `;
+
+    const titleEl = document.createElement("span");
+    titleEl.style.cssText = "font-weight:800;font-size:13px;letter-spacing:3px;color:#3b82f6;text-transform:uppercase;flex-shrink:0;";
+    titleEl.textContent = "Collection";
+
+    const countEl = document.createElement("span");
+    countEl.style.cssText = "font-size:11px;color:#6b7280;flex-shrink:0;";
+
+    const refreshBtn = document.createElement("button");
+    refreshBtn.textContent = "↻ Refresh";
+    refreshBtn.title = "Reload collection from server";
+    refreshBtn.style.cssText = "background:none;border:1px solid #1f2937;border-radius:12px;color:#6b7280;cursor:pointer;font-size:11px;padding:2px 10px;flex-shrink:0;";
+    refreshBtn.addEventListener("click", () => {
+      collectionCache = null;
+      loadCollection();
+    });
+
+    const headerSpacer = document.createElement("div");
+    headerSpacer.style.cssText = "flex:1;";
+
+    const closeBtn = document.createElement("button");
+    closeBtn.textContent = "✕";
+    closeBtn.style.cssText = "background:none;border:none;color:#6b7280;cursor:pointer;font-size:16px;line-height:1;padding:0;flex-shrink:0;";
+    closeBtn.addEventListener("click", closePanel);
+
+    header.appendChild(titleEl);
+    header.appendChild(countEl);
+    header.appendChild(refreshBtn);
+    header.appendChild(headerSpacer);
+    header.appendChild(closeBtn);
+
+    const filterBar = document.createElement("div");
+    filterBar.style.cssText = `
+      flex-shrink:0; display:flex; flex-wrap:wrap; align-items:center; gap:8px;
+      padding:10px 18px; background:#0d1525; border-bottom:1px solid #1f2937;
+    `;
+
+    for (const r of RARITIES) {
+      const color = RARITY_COLORS[r] || "#9ca3af";
+      const btn = document.createElement("button");
+      btn.textContent = r.charAt(0).toUpperCase() + r.slice(1);
+      btn.dataset.rarity = r;
+      btn.style.cssText = `
+        padding:3px 10px; border-radius:20px; font-size:11px; cursor:pointer;
+        border:1px solid ${color}40; background:transparent; color:${color};
+        transition:background 0.15s;
+      `;
+      btn.addEventListener("click", () => {
+        if (cpFilter.rarities.has(r)) {
+          cpFilter.rarities.delete(r);
+          btn.style.background = "transparent";
+          btn.style.fontWeight = "";
+        } else {
+          cpFilter.rarities.add(r);
+          btn.style.background = color + "33";
+          btn.style.fontWeight = "700";
+        }
+        renderGrid();
       });
-
-      const flag = document.createElement("img");
-      flag.src = src;
-      flag.style.cssText =
-        "width:20px;height:13.5px;border-radius:2px;object-fit:cover;flex-shrink:0;";
-
-      const lbl = document.createElement("span");
-      lbl.textContent = code.toUpperCase();
-      lbl.style.cssText = "font-size:12px;font-family:monospace;color:#d1d5db;";
-
-      row.appendChild(cb);
-      row.appendChild(flag);
-      row.appendChild(lbl);
-      container.appendChild(row);
+      filterBar.appendChild(btn);
     }
 
-    // Sort alphabetically — only move nodes if the order actually changed
-    const rows = [...container.querySelectorAll("[data-code]")];
-    const sorted = [...rows].sort((a, b) =>
-      a.dataset.code.localeCompare(b.dataset.code),
-    );
-    if (rows.some((r, i) => r !== sorted[i])) {
-      sorted.forEach((r) => container.appendChild(r));
+    const shinyBtn = document.createElement("button");
+    shinyBtn.textContent = "✨ Shiny";
+    shinyBtn.style.cssText = `
+      padding:3px 10px; border-radius:20px; font-size:11px; cursor:pointer;
+      border:1px solid #fbbf2440; background:transparent; color:#fbbf24;
+      transition:background 0.15s;
+    `;
+    shinyBtn.addEventListener("click", () => {
+      cpFilter.shinyOnly = !cpFilter.shinyOnly;
+      shinyBtn.style.background = cpFilter.shinyOnly ? "#fbbf2433" : "transparent";
+      shinyBtn.style.fontWeight = cpFilter.shinyOnly ? "700" : "";
+      renderGrid();
+    });
+    filterBar.appendChild(shinyBtn);
+
+    const FAVS_MODES = ["off", "only", "hide"];
+    const FAVS_LABELS = { off: "♥ Favs", only: "♥ Only", hide: "✕ Favs" };
+    const favsBtn = document.createElement("button");
+    favsBtn.style.cssText = `
+      padding:3px 10px; border-radius:20px; font-size:11px; cursor:pointer;
+      border:1px solid #ef444440; background:transparent; color:#ef4444;
+      transition:background 0.15s;
+    `;
+    const syncFavsBtn = () => {
+      favsBtn.textContent = FAVS_LABELS[cpFilter.favsMode];
+      favsBtn.style.fontWeight = cpFilter.favsMode !== "off" ? "700" : "";
+      favsBtn.style.background = cpFilter.favsMode !== "off" ? "#ef444433" : "transparent";
+    };
+    syncFavsBtn();
+    favsBtn.addEventListener("click", () => {
+      const i = FAVS_MODES.indexOf(cpFilter.favsMode);
+      cpFilter.favsMode = FAVS_MODES[(i + 1) % FAVS_MODES.length];
+      syncFavsBtn();
+      renderGrid();
+    });
+    filterBar.appendChild(favsBtn);
+
+    const COUNTRY_CODES = ["AD","AE","AF","AG","AI","AL","AM","AO","AQ","AR","AT","AU","AW","AX","AZ","BA","BB","BD","BE","BG","BH","BN","BO","BR","BW","BY","BZ","CA","CH","CK","CL","CN","CO","CR","CU","CV","CW","CY","CZ","DE","DK","DO","DZ","EC","EE","EG","ES","FI","FJ","FO","FR","GB","GE","GG","GH","GI","GL","GP","GR","GT","GU","GY","HK","HM","HN","HR","HU","ID","IE","IL","IM","IN","IQ","IR","IS","IT","JE","JM","JO","JP","KE","KG","KH","KR","KW","KZ","LA","LB","LK","LT","LU","LV","LY","MA","MD","ME","MF","MK","MM","MN","MO","MP","MQ","MT","MU","MV","MX","MY","NC","NG","NI","NL","NO","NP","NZ","OM","PA","PE","PF","PH","PK","PL","PR","PS","PT","PY","QA","RE","RO","RS","RU","SA","SC","SD","SE","SG","SH","SI","SJ","SK","SM","SR","SV","SY","TH","TN","TR","TT","TW","UA","US","UY","UZ","VA","VE","VN","YE","ZA"];
+
+    const countrySelect = document.createElement("select");
+    countrySelect.style.cssText = `
+      height:26px; border-radius:20px; font-size:11px; cursor:pointer;
+      border:1px solid #1f293740; background:#080f1e; color:#9ca3af;
+      padding:0 8px; outline:none;
+    `;
+    const allOpt = document.createElement("option");
+    allOpt.value = "";
+    allOpt.textContent = "🌍 All";
+    countrySelect.appendChild(allOpt);
+    for (const cc of COUNTRY_CODES) {
+      const opt = document.createElement("option");
+      opt.value = cc.toLowerCase();
+      opt.textContent = `${String.fromCodePoint(...[...cc].map(c => 0x1F1E6 + c.charCodeAt(0) - 65))} ${cc}`;
+      countrySelect.appendChild(opt);
     }
+    countrySelect.addEventListener("change", () => {
+      cpFilter.country = countrySelect.value;
+      countrySelect.style.color = cpFilter.country ? "#60a5fa" : "#9ca3af";
+      countrySelect.style.borderColor = cpFilter.country ? "#3b82f640" : "#1f293740";
+      clearCountryBtn.style.display = cpFilter.country ? "inline-flex" : "none";
+      renderGrid();
+    });
+    filterBar.appendChild(countrySelect);
+
+    const clearCountryBtn = document.createElement("button");
+    clearCountryBtn.textContent = "✕";
+    clearCountryBtn.title = "Clear country filter";
+    clearCountryBtn.style.cssText = `
+      display:none; align-items:center; justify-content:center;
+      padding:3px 8px; border-radius:20px; font-size:11px; cursor:pointer;
+      border:1px solid #3b82f640; background:#3b82f622; color:#60a5fa;
+    `;
+    clearCountryBtn.addEventListener("click", () => {
+      cpFilter.country = "";
+      countrySelect.value = "";
+      countrySelect.style.color = "#9ca3af";
+      countrySelect.style.borderColor = "#1f293740";
+      clearCountryBtn.style.display = "none";
+      renderGrid();
+    });
+    filterBar.appendChild(clearCountryBtn);
+
+    const searchInput = document.createElement("input");
+    searchInput.type = "text";
+    searchInput.placeholder = "Search name…";
+    searchInput.style.cssText = `
+      margin-left:auto; padding:3px 10px; border-radius:20px; font-size:11px;
+      border:1px solid #1f2937; background:#080f1e; color:#f9fafb;
+      outline:none; width:180px;
+    `;
+    searchInput.addEventListener("input", () => {
+      cpFilter.query = searchInput.value.trim().toLowerCase();
+      renderGrid();
+    });
+    filterBar.appendChild(searchInput);
+
+    const statusBar = document.createElement("div");
+    statusBar.style.cssText = `
+      flex-shrink:0; padding:6px 18px; font-size:11px; color:#60a5fa;
+      background:#0d1525; border-bottom:1px solid #1f2937; display:none;
+    `;
+
+    const gridWrap = document.createElement("div");
+    gridWrap.style.cssText = "flex:1; overflow-y:auto; padding:16px 18px;";
+
+    const grid = document.createElement("div");
+    grid.style.cssText = "display:flex; flex-wrap:wrap; gap:12px;";
+    gridWrap.appendChild(grid);
+
+    overlay.appendChild(header);
+    overlay.appendChild(filterBar);
+    overlay.appendChild(statusBar);
+    overlay.appendChild(gridWrap);
+    document.body.appendChild(overlay);
+
+    function setStatus(msg) {
+      statusBar.textContent = msg;
+      statusBar.style.display = msg ? "block" : "none";
+    }
+
+    function passesFilter(card) {
+      if (cpFilter.rarities.size > 0 && !cpFilter.rarities.has(card.rarity))
+        return false;
+      if (cpFilter.shinyOnly && !card.isShiny) return false;
+      if (cpFilter.favsMode === "only" && !card.isFavorited) return false;
+      if (cpFilter.favsMode === "hide" && card.isFavorited) return false;
+      if (cpFilter.query && !card.name.toLowerCase().includes(cpFilter.query))
+        return false;
+      if (cpFilter.country) {
+        const code = (card.countryCode || card.nationality || "").toLowerCase();
+        if (code !== cpFilter.country) return false;
+      }
+      return true;
+    }
+
+    function renderGrid() {
+      const visible = collectionCache ? collectionCache.filter(passesFilter) : [];
+      countEl.textContent = collectionCache ? ` ${visible.length} / ${collectionCache.length}` : "";
+      grid.innerHTML = "";
+      if (visible.length === 0) return;
+      const preloadedStates = loadCardStates();
+      let i = 0;
+      function batch() {
+        const frag = document.createDocumentFragment();
+        const end = Math.min(i + 50, visible.length);
+        while (i < end) {
+          frag.appendChild(buildCardTile(normalizeApiCard(visible[i]), null, preloadedStates));
+          i++;
+        }
+        grid.appendChild(frag);
+        if (i < visible.length) requestAnimationFrame(batch);
+      }
+      requestAnimationFrame(batch);
+    }
+
+    async function loadCollection() {
+      setStatus("Loading collection…");
+      grid.innerHTML = "";
+      countEl.textContent = "";
+      collectionCache = [];
+      try {
+        const preloadedStates = loadCardStates();
+        const { cards: raw, totalMatching } = await fetchCollection(
+          (loaded, total) => setStatus(`Loading… ${loaded} / ${total}`),
+          (newCards, total) => {
+            if (!newCards.length) return;
+            const frag = document.createDocumentFragment();
+            for (const card of newCards) {
+              collectionCache.push(card);
+              frag.appendChild(buildCardTile(normalizeApiCard(card), null, preloadedStates));
+            }
+            grid.appendChild(frag);
+            countEl.textContent = ` ${collectionCache.length} / ${total || "?"}`;
+          },
+        );
+        collectionCache = raw;
+        syncFavStatesFromApi(raw);
+        countEl.textContent = ` ${raw.length} / ${raw.length}`;
+        const totalInstances = raw.reduce((s, c) => s + (c.count || 1), 0);
+        setStatus(totalInstances > raw.length
+          ? `${raw.length} unique · ${totalInstances} total copies`
+          : `${raw.length} cards`);
+      } catch (err) {
+        setStatus(`Error: ${err.message}`);
+      }
+    }
+
+    function onEsc(e) {
+      if (e.key === "Escape") closePanel();
+    }
+
+    function openPanel() {
+      overlay.style.display = "flex";
+      document.addEventListener("keydown", onEsc);
+      if (!collectionCache) {
+        loadCollection();
+      } else {
+        renderGrid();
+      }
+    }
+
+    function closePanel() {
+      overlay.style.display = "none";
+      document.removeEventListener("keydown", onEsc);
+    }
+
+    overlay._open = openPanel;
+
+    document.addEventListener("gcb:favchange", ({ detail }) => {
+      if (!collectionCache || overlay.style.display === "none") return;
+      const card = collectionCache.find((c) => c.id === detail.cardId && !!c.isShiny === detail.isShiny);
+      if (card) {
+        card.isFavorited = detail.isFavorited;
+        renderGrid();
+      }
+    });
+
+    document.addEventListener("gcb:carddeleted", ({ detail }) => {
+      if (!collectionCache || overlay.style.display === "none") return;
+      const idx = collectionCache.findIndex((c) => c.id === detail.cardId && !!c.isShiny === detail.isShiny);
+      if (idx !== -1) {
+        collectionCache.splice(idx, 1);
+        renderGrid();
+      }
+    });
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -2667,47 +2829,19 @@
   buildHistoryModal();
   buildMythicModal();
   buildBlacklistModal();
+  buildCollectionPanel();
 
-  let collectionTabWasSeen = false;
-
-  // Update collection filter section visibility when tabs change
   function syncFilterSection() {
-    const section = DOMCache.get("gcb-filter-section");
-    if (!section) return;
     if (isCollectionTabActive()) {
-      section.style.display = "block";
-      // Start the observer before stamping so it catches any cards React adds
-      // in subsequent mutations while the tab stays open.
       startDeletionObserver();
-      // Briefly hide the grid while we stamp data-gcb-deleted. Both the hide and
-      // the attribute stamps are synchronous — the browser batches them into one
-      // paint, so deleted cards are never visible even for a single frame.
       const grid = document.querySelector("#tabs-content-collection .grid");
       if (grid) grid.style.visibility = "hidden";
       applyCollectionDeletions();
       if (grid) grid.style.visibility = "";
       cacheCollectionCardMeta();
       applyCollectionFavStates();
-      refreshCountryList();
-      applyFilters();
-
-      if (!collectionTabWasSeen) {
-        collectionTabWasSeen = true;
-        loadAllCards();
-      } else if (!loadingAllCards && findLoadMoreButton()) {
-        // Native search/filter was cleared and the site reset to page 1 —
-        // re-run loadAllCards to expand the collection again.
-        loadAllCards();
-      }
     } else {
-      section.style.display = "none";
-      collectionTabWasSeen = false;
       stopDeletionObserver();
-      // Cancel any pending idle filter — DOM is no longer visible, stale run would be wasteful.
-      cancelIdleFilter();
-      // Clear metadata cache — DOM may differ on next tab activation (React may remount cards).
-      clearCardMetaCache();
-      _lastCountryCardCount = 0;
     }
   }
 
@@ -2765,6 +2899,7 @@
 
   // Initial boot
   setTimeout(() => {
+    fetchMyPlayerId();
     syncFilterSection();
     syncStatus();
     if (prefs.autoOpen) {
@@ -2864,7 +2999,7 @@
     const res = await fetch("/api/collection", {
       method: "DELETE",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ playerIds: [playerId] }),
+      body: JSON.stringify({ deleteTargets: [{ playerId, isShiny: false, isSigned: false, quantity: 1 }] }),
     });
     const text = await res.text();
     console.log(
